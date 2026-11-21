@@ -1,0 +1,16 @@
+{
+	"admin/services/peers-ss": {
+		"title": "Peers-SS",
+		"order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-peers-ss" ] }
+	},
+	"admin/services/peers-ss/overview": { "title": "Обзор", "order": 10, "action": { "type": "view", "path": "peers-ss/overview" } },
+	"admin/services/peers-ss/groups": { "title": "Группы и среды", "order": 20, "action": { "type": "view", "path": "peers-ss/groups" } },
+	"admin/services/peers-ss/devices": { "title": "Устройства", "order": 30, "action": { "type": "view", "path": "peers-ss/devices" } },
+	"admin/services/peers-ss/invite": { "title": "Добавить роутер", "order": 40, "action": { "type": "view", "path": "peers-ss/invite" } },
+	"admin/services/peers-ss/token": { "title": "Токен", "order": 50, "action": { "type": "view", "path": "peers-ss/token" } },
+	"admin/services/peers-ss/notify": { "title": "Уведомления", "order": 60, "action": { "type": "view", "path": "peers-ss/notify" } },
+	"admin/services/peers-ss/settings": { "title": "Настройки", "order": 70, "action": { "type": "view", "path": "peers-ss/settings" } },
+	"admin/services/peers-ss/diag": { "title": "Диагностика", "order": 80, "action": { "type": "view", "path": "peers-ss/diag" } }
+}

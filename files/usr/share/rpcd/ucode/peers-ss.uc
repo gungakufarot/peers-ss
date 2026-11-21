@@ -131,7 +131,7 @@ const methods = {
 			for (let b in C.all_bindings(x.contour)) cards[b] = card_view(x, b);
 			let rots = {};
 			for (let b in C.all_bindings(x.contour)) { let r = rotation_view(x, b); if (r) rots[b] = { server_id: r.server_id, location_id: r.location_id, rev: r.rev }; }
-			return { contour: x.contour, me: x.rid, routers: routers_view(x), cards, rotations: rots,
+			return { contour: x.contour, me: x.rid, repo: x.repo, routers: routers_view(x), cards, rotations: rots,
 				archive: x.contour.archive ?? [], settings: C.settings(x.contour) };
 		}
 	},

@@ -12,6 +12,7 @@ import * as PK from './podkop.uc';
 import * as H from './health.uc';
 import * as P from './ping.uc';
 import { fp } from './crypto.uc';
+import { try_rekey } from './invite.uc';
 
 const VERSION = '0.5.0';
 const STATE = U.RUN + '/state.json';
@@ -50,6 +51,16 @@ function init() {
 
 function refresh_contour() {
 	let r = ST.get(C.p_contour(X.cid));
+	// contour password changed on another router: follow the rekey chain (spec §8 «Сменить пароль контура»)
+	for (let i = 0; i < 5 && !r.ok && r.bad_key; i++) {
+		let nk = try_rekey(X.cid, X.key);
+		if (!nk) break;
+		U.log('info', 'contour password was changed — switching to the new key');
+		X.key = nk;
+		S.set('contour_key', nk);
+		ST.set_key(nk);
+		r = ST.get(C.p_contour(X.cid));
+	}
 	let online = r.ok;
 	if (!r.ok && !r.bad_key && !r.rollback) {
 		// GitHub unreachable: keep working with the last known contour (binding must not be lost)
@@ -603,6 +614,38 @@ function handle_reports(recs) {
 	}
 }
 
+// ---------- requests from LuCI on other routers: list vless configs through my token ----------
+function serve_requests() {
+	if (!X.token) return;
+	let path = X.cid + '/requests/' + X.rid + '.json';
+	let r = ST.get(path);
+	if (!r.ok || r.obj.answered_at || ST.now() - (r.obj.at ?? 0) > 300) return;
+	let c = API.configs(X.token);
+	if (!c.ok) return;
+	let list = map(API.vless_configs(c.data), (q) => ({ id: q.id, title: q.title, expires_at: q.expires_at, location_id: q.location_id,
+		server_id: q.server_id, binding: X.acct + ':' + q.id }));
+	ST.update(path, (o) => o && !o.answered_at ? { ...o, answered_at: ST.now(), account: +X.acct, configs: list } : null, { message: 'configs answer' });
+	U.log('info', 'answered configs request from ' + C.router_name(X.contour, r.obj.from));
+}
+
+// a config assigned in LuCI on any router: the token router of that account creates rotations/<binding>.json
+function ensure_rotation_files() {
+	if (!X.token || st.ensured_sha == st.contour_sha) return;
+	let ok = true;
+	for (let bnd in C.all_bindings(X.contour)) {
+		if (!my_token_fits(bnd)) continue;
+		let r = ST.get(C.p_rotation(X.cid, bnd));
+		if (r.ok || !r.missing) continue;
+		let fc = find_config(X.token, C.parse_binding(bnd).config_id);
+		if (fc.err) { ok = false; continue; }
+		let w = ST.put(C.p_rotation(X.cid, bnd), { rev: 1, binding: bnd, url: fc.cfg.connection_url, server_id: fc.cfg.server_id,
+			location_id: fc.cfg.location_id, history: [], blacklist: {}, reports: {}, triggers: {}, lock: null, updated_at: ST.now() },
+			null, 'rotation ' + bnd + ': initial link');
+		if (w.ok) U.log('info', 'created rotation file for ' + bnd); else ok = false;
+	}
+	if (ok) st.ensured_sha = st.contour_sha;
+}
+
 // ---------- reconcile + cards (token router) ----------
 function write_card(cfg, exists) {
 	if (!X.bot_key) return;
@@ -698,7 +741,7 @@ function tick_inner() {
 	let now_m = ST.mono();
 	U.cleanup_tmp();
 	let gh_ok = refresh_contour();
-	if (!X.binding) { st.status = 'no_binding'; if (gh_ok) heartbeat(); return; }
+	if (!X.binding) { st.status = 'no_binding'; if (gh_ok) { heartbeat(); serve_requests(); ensure_rotation_files(); } return; }
 	if (st.status == 'update_required') return;
 
 	// podkop changed after update? (spec §7)
@@ -787,6 +830,8 @@ function tick_inner() {
 	if (gh_ok) {
 		let recs = recs_refresh(st.status != 'ok');
 		if (my_token_fits(X.binding)) { handle_reports(recs); reconcile(recs, 600); }
+		serve_requests();
+		ensure_rotation_files();
 		heartbeat();
 		if (now_m - (st.watch_mono ?? 0) > 600 && length(keys(recs))) { watchdog(recs); write_summary(recs); st.watch_mono = now_m; }
 	}
