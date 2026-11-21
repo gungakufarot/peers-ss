@@ -25,10 +25,11 @@ function version() {
 	return trim(r.out);
 }
 
+// proxy sections Peers-SS can manage (proxy + url type, or proxy without a type yet)
 function proxy_sections() {
 	let c = cursor(), out = [];
 	c.foreach('podkop', 'section', (s) => {
-		if (s.connection_type == 'proxy') push(out, s['.name']);
+		if (s.connection_type == 'proxy' && (s.proxy_config_type ?? 'url') == 'url') push(out, s['.name']);
 	});
 	return out;
 }
@@ -59,6 +60,19 @@ function create_section(name, c) {
 	c.set('podkop', name, 'enable_udp_over_tcp', '0');
 	c.set('podkop', name, 'mixed_proxy_enabled', '1');
 	c.set('podkop', name, 'mixed_proxy_port', '' + port);
+	return true;
+}
+
+// Router's own traffic goes into the tunnel when its destination is in podkop's fake-IP set (a section's domain
+// lists match, podkop nft.sh mangle_output) — regardless of enable_output_network_interface (that one only binds
+// sing-box's direct outbound to an interface). So API/GitHub hosts must be in an exclusion section (spec §6).
+const DIRECT_HOSTS = ['api.stealthsurf.net', 'api.github.com', 'github.com', 'objects.githubusercontent.com', 'raw.githubusercontent.com'];
+function ensure_exclusion(c) {
+	if (c.get('podkop', 'peers_ss_direct') != null) return false;
+	c.set('podkop', 'peers_ss_direct', 'section');
+	c.set('podkop', 'peers_ss_direct', 'connection_type', 'exclusion');
+	c.set('podkop', 'peers_ss_direct', 'user_domain_list_type', 'dynamic');
+	c.set('podkop', 'peers_ss_direct', 'user_domains', DIRECT_HOSTS);
 	return true;
 }
 
@@ -219,7 +233,7 @@ function apply_link(link, opts) {
 	if (c.get('podkop', name) != null && !section_ok(name))
 		return { changed: false, ok: false, err: 'podkop section is not a url proxy section: ' + name, podkop_changed: true };
 	let cur = c.get('podkop', name, 'proxy_string');
-	if (cur == link && !opts.force) return { changed: false, ok: true };
+	if (cur == link && !opts.force && c.get('podkop', 'peers_ss_direct') != null) return { changed: false, ok: true };
 	if (!lock()) return { changed: false, ok: false, err: 'podkop is locked by another apply' };
 	backup_orig();
 	mkdirp(RUN);
@@ -228,6 +242,7 @@ function apply_link(link, opts) {
 	c.revert('podkop');
 	create_section(name, c);
 	ensure_mixed(name, c);
+	ensure_exclusion(c);
 	c.set('podkop', name, 'proxy_config_type', 'url');
 	c.set('podkop', name, 'proxy_string', link);
 	c.commit('podkop');

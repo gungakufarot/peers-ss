@@ -5,6 +5,8 @@
 # Files are taken from the latest GitHub Release (not from main). PEERS_SS_TARBALL=<url|path> overrides (testing).
 set -e
 
+# whole script inside main(): a truncated download never runs half of it
+main() {
 REPO_CODE="gungakufarot/peers-ss"
 JOIN=""
 while [ $# -gt 0 ]; do
@@ -19,7 +21,7 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 ask() { printf '%s' "$1" >/dev/tty; read -r REPLY </dev/tty || REPLY=""; }
 
-[ -r /dev/tty ] || die "no terminal: run the installer in an interactive SSH session"
+( exec </dev/tty ) 2>/dev/null || die "no terminal: run the installer in an interactive SSH session (ssh -t)"
 
 # ---- 1. checks ----
 . /etc/openwrt_release 2>/dev/null || die "not OpenWrt"
@@ -50,6 +52,8 @@ if [ -n "$need" ]; then
 	opkg update >/dev/null || die "opkg update failed"
 	# shellcheck disable=SC2086
 	opkg install $need || die "opkg install failed"
+	FREE_KB=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')
+	[ "${FREE_KB:-0}" -ge 512 ] || die "not enough free flash after installing packages (${FREE_KB} KB)"
 fi
 
 # ---- 2. files from the latest release ----
@@ -59,10 +63,17 @@ if [ -z "$PEERS_SS_TARBALL" ]; then
 	TAG=$(curl -fsSL "https://api.github.com/repos/$REPO_CODE/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
 	[ -n "$TAG" ] || die "cannot find the latest release of $REPO_CODE"
 	PEERS_SS_TARBALL="https://github.com/$REPO_CODE/releases/download/$TAG/peers-ss-$TAG.tar.gz"
+	PEERS_SS_SUMS="https://github.com/$REPO_CODE/releases/download/$TAG/SHA256SUMS"
 	say "Release $TAG"
 fi
 case "$PEERS_SS_TARBALL" in
-	http*) curl -fsSL -o "$TMPD/p.tgz" "$PEERS_SS_TARBALL" || die "download failed: $PEERS_SS_TARBALL" ;;
+	http*) curl -fsSL -o "$TMPD/p.tgz" "$PEERS_SS_TARBALL" || die "download failed: $PEERS_SS_TARBALL"
+		if [ -n "$PEERS_SS_SUMS" ]; then
+			curl -fsSL -o "$TMPD/SUMS" "$PEERS_SS_SUMS" || die "cannot download SHA256SUMS"
+			want=$(grep " peers-ss-$TAG.tar.gz\$" "$TMPD/SUMS" | cut -d' ' -f1)
+			have=$(sha256sum "$TMPD/p.tgz" | cut -d' ' -f1)
+			[ -n "$want" ] && [ "$want" = "$have" ] || die "checksum mismatch for peers-ss-$TAG.tar.gz"
+		fi ;;
 	*) cp "$PEERS_SS_TARBALL" "$TMPD/p.tgz" ;;
 esac
 mkdir "$TMPD/root"
@@ -71,9 +82,12 @@ tar -xzf "$TMPD/p.tgz" -C "$TMPD/root" || die "bad archive"
 /etc/init.d/peers-ss stop 2>/dev/null || true
 KEEP_CFG=""
 [ -f /etc/config/peers-ss ] && KEEP_CFG=1
-( cd "$TMPD/root" && find . -type f ! -path ./etc/config/peers-ss ) | while read -r f; do
-	mkdir -p "/$(dirname "$f")"; cp "$TMPD/root/$f" "/$f"
-done
+# previous version's code is replaced as a whole
+rm -rf /usr/share/peers-ss
+( cd "$TMPD/root" && find . -type f ! -path ./etc/config/peers-ss ) > "$TMPD/list"
+while read -r f; do
+	mkdir -p "/$(dirname "$f")" && cp "$TMPD/root/$f" "/$f" || die "copying $f failed (flash full?) — run the installer again"
+done < "$TMPD/list"
 [ -n "$KEEP_CFG" ] || cp "$TMPD/root/etc/config/peers-ss" /etc/config/peers-ss
 chmod 755 /usr/bin/peers-ss /etc/init.d/peers-ss
 # keep settings across sysupgrade (spec §3)
@@ -90,3 +104,6 @@ if [ -n "$JOIN" ]; then
 else
 	/usr/bin/peers-ss wizard </dev/tty
 fi
+}
+
+main "$@"

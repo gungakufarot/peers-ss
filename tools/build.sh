@@ -44,4 +44,5 @@ echo "2.0" > "$OUT/ipk/debian-binary"
 ( cd "$OUT/tree" && tar --owner=0 --group=0 --numeric-owner -czf ../ipk/data.tar.gz . )
 ( cd "$OUT/ipk" && tar --owner=0 --group=0 --numeric-owner -czf "../peers-ss_${VER}_all.ipk" ./debian-binary ./control.tar.gz ./data.tar.gz )
 rm -rf "$OUT/ipk" "$OUT/tree"
+( cd "$OUT" && sha256sum "peers-ss-$TAG.tar.gz" "peers-ss_${VER}_all.ipk" > SHA256SUMS )
 ls -l "$OUT"

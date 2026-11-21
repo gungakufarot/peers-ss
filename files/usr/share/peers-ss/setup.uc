@@ -38,14 +38,15 @@ function create_contour(name, password, repo, binding, cfg) {
 	let key = contour_key(password, cid);
 	ST.init(repo, gh, key);
 	let contour = C.new_contour(name, rid, binding);
-	let w = ST.put(C.p_contour(cid), contour, null, 'contour ' + cid + ': create');
-	if (!w.ok) return { ok: false, err: 'cannot create contour.json (HTTP ' + w.status + ')' };
+	// rotation file first: a failure leaves no half-created contour
 	if (binding && cfg) {
 		let r = ST.put(C.p_rotation(cid, binding), { rev: 1, binding, url: cfg.connection_url, server_id: cfg.server_id,
 			location_id: cfg.location_id, history: [], blacklist: {}, reports: {}, triggers: {}, lock: null, updated_at: ST.now() },
 			null, 'rotation ' + binding + ': initial link');
-		if (!r.ok && !r.conflict) return { ok: false, err: 'cannot write rotation file' };
+		if (!r.ok) return { ok: false, err: r.status == 403 ? 'GitHub token has no write access (Contents: Read and write)' : 'cannot write rotation file (HTTP ' + r.status + ')' };
 	}
+	let w = ST.put(C.p_contour(cid), contour, null, 'contour ' + cid + ': create');
+	if (!w.ok) return { ok: false, err: w.status == 403 ? 'GitHub token has no write access (Contents: Read and write)' : 'cannot create contour.json (HTTP ' + w.status + ')' };
 	set_identity(rid, cid, repo);
 	S.set('contour_key', key);
 	U.log('info', 'contour ' + cid + ' created, router ' + rid + ' = openwrt-1');
