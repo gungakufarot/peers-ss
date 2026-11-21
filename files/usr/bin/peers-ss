@@ -8,6 +8,8 @@ import * as U from '/usr/share/peers-ss/util.uc';
 import * as S from '/usr/share/peers-ss/secrets.uc';
 import * as API from '/usr/share/peers-ss/api.uc';
 import * as P from '/usr/share/peers-ss/ping.uc';
+import * as PK from '/usr/share/peers-ss/podkop.uc';
+import { fp } from '/usr/share/peers-ss/crypto.uc';
 
 const VERSION = '0.1.0';
 U.set_log_echo(false);
@@ -147,9 +149,61 @@ function cmd_locations() {
 	out(sprintf('%d locations (excluded: %s); API %.2fs, ping %.2fs', length(r), join(',', excl), el(t0, t1), el(t1, t2)));
 }
 
+// ---- podkop ----
+function selected_cfg() {
+	let bind = uci_get('selected_config');
+	if (!bind) fail('no config selected (peers-ss config select)');
+	let id = +split(bind, ':')[1];
+	for (let c in list_vless(need_token())) if (c.id == id) return c;
+	fail('selected config not found in account');
+}
+
+function print_apply(r) {
+	out(sprintf('changed: %s, ok: %s%s', r.changed, r.ok, r.err ? ', error: ' + r.err : ''));
+	if (r.diag) out('diagnostics: ' + (r.diag.ok ? 'green' : 'FAIL ' + join(',', r.diag.fails)));
+	if (r.latency) out(sprintf('latency via vless: %s ms (%s)', r.latency.ms ?? 'n/a', r.latency.method));
+}
+
+function cmd_podkop(args) {
+	let sub = args[0] ?? 'status';
+	if (sub == 'status') {
+		let name = PK.section();
+		out(sprintf('podkop %s, section %s: %s, proxy sections: %s', PK.version(), name, PK.section_ok(name) ? 'ok' : 'MISSING',
+			join(',', PK.proxy_sections())));
+		let l = PK.current_link();
+		out('current link: ' + (l ? 'set, fingerprint ' + fp(l) : 'none'));
+		out('mixed proxy: ' + (PK.mixed_proxy_url() ?? 'disabled'));
+		out('sing-box: ' + (PK.sing_box_running() ? 'running' : 'stopped'));
+		return;
+	}
+	if (sub == 'setup') {
+		let name = PK.section();
+		let created = PK.create_section(name), mixed = PK.ensure_mixed(name);
+		out(sprintf('section %s: %s; mixed proxy: %s (not applied until a link is set)', name, created ? 'created' : 'exists', mixed ? 'enabled' : 'already on'));
+		return;
+	}
+	if (sub == 'apply') {
+		let c = selected_cfg();
+		let t0 = time();
+		let r = PK.apply_link(c.connection_url, { force: args[1] == '--force' });
+		print_apply(r);
+		out(sprintf('took %ds', time() - t0));
+		return;
+	}
+	if (sub == 'diag') {
+		let d = PK.diagnostics();
+		out(sprintf('%J', { ok: d.ok, fails: d.fails, dns: d.dns, sing_box: d.sing_box, nft: d.nft, fakeip: d.fakeip?.fakeip, outbound: d.outbound }));
+		let l = PK.latency();
+		out(sprintf('latency via vless: %s ms (%s)', l.ms ?? 'n/a', l.method));
+		out('tunnel (layer 4): ' + (PK.tunnel_check().ok ? 'ok' : 'FAIL'));
+		return;
+	}
+	fail('usage: peers-ss podkop status|setup|apply [--force]|diag');
+}
+
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force]|diag\n  version');
 }
 
 let argv = [...ARGV];
@@ -159,6 +213,7 @@ case 'token': cmd_token(argv); break;
 case 'configs': cmd_configs(); break;
 case 'config': cmd_config(argv); break;
 case 'locations': cmd_locations(); break;
+case 'podkop': cmd_podkop(argv); break;
 case 'version': out(VERSION); break;
 default: usage(); exit(cmd ? 1 : 0);
 }
