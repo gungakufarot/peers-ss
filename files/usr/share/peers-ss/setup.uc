@@ -64,9 +64,10 @@ function open_contour(cid, password, repo, gh) {
 
 // register this router into env (group_id may be null for standalone; env_id null -> new env)
 // returns { ok, rid, name, binding, err }
-function register_router(cid, key, repo, gh, target) {
+function register_router(cid, key, repo, gh, target, rid) {
 	ST.init(repo, gh, key);
-	let rid = new_rid(), name = null, binding = null;
+	rid ??= new_rid();
+	let name = null, binding = null;
 	let w = ST.update(C.p_contour(cid), (c) => {
 		if (!c) return null;
 		let n = { ...c, rev: (c.rev ?? 0) + 1 };

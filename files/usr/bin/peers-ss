@@ -15,6 +15,8 @@ import * as SU from '/usr/share/peers-ss/setup.uc';
 import * as ST from '/usr/share/peers-ss/store.uc';
 import * as C from '/usr/share/peers-ss/contour.uc';
 import { request } from '/usr/share/peers-ss/http.uc';
+import * as INV from '/usr/share/peers-ss/invite.uc';
+import * as OPS from '/usr/share/peers-ss/ops.uc';
 
 const VERSION = E.VERSION;
 U.set_log_echo(false);
@@ -367,9 +369,6 @@ function cmd_config_assign() {
 	if (r.ok) print_apply(PK.apply_link(r.obj.url, { setup: true }));
 }
 
-// ---- join wizard (spec §4, mode B) — implemented in stage 8 ----
-function cmd_join_wizard(code) { fail('joining by invite is not available in this version'); }
-
 // ---- installer wizard (spec §4, mode A) ----
 function ask_nonempty(prompt, re, errmsg) {
 	while (true) {
@@ -390,10 +389,11 @@ function choose_podkop_section() {
 	out('podkop proxy sections with a URL link (Peers-SS will replace that link):');
 	let n = 1;
 	for (let s in secs) out(sprintf('  %d) %s', n++, s));
-	out(sprintf('  %d) create new section «peers_ss»', n));
+	let newname = index(secs, 'peers_ss') < 0 ? 'peers_ss' : 'peers_ss_' + (length(secs) + 1);
+	out(sprintf('  %d) create new section «%s»', n, newname));
 	while (true) {
 		let a = ask(sprintf('Section number 1-%d: ', n));
-		if (match(a ?? '', /^[0-9]+$/) && +a >= 1 && +a <= n) return +a == n ? 'peers_ss' : secs[+a - 1];
+		if (match(a ?? '', /^[0-9]+$/) && +a >= 1 && +a <= n) return +a == n ? newname : secs[+a - 1];
 		if (a == null) fail('aborted');
 	}
 }
@@ -407,6 +407,52 @@ function wizard_finish(link) {
 	} else out('No config assigned yet: this router works as a follower until a config is assigned (LuCI or `peers-ss config assign`).');
 	system('/etc/init.d/peers-ss enable; /etc/init.d/peers-ss restart >/dev/null 2>&1');
 	out('Peers-SS service started. LuCI: Services → Peers-SS.');
+}
+
+// ---- join wizard (spec §4, mode B) ----
+function cmd_join_wizard(code) {
+	if (uci_get('contour_id')) fail(sprintf('this router is already in contour %s — run `peers-ss uninstall` first', uci_get('contour_id')));
+	let inv = INV.decode(code);
+	if (!inv) fail('invalid invite code (must start with PSS1.)');
+	out('== Peers-SS: joining contour ' + inv.cid + ' ==');
+	let o = null;
+	for (let i = 0; i < 5; i++) {
+		let pw = ask('Contour password (shown as typed): ');
+		if (pw == null) fail('aborted');
+		o = SU.open_contour(inv.cid, pw, inv.repo, inv.gh);
+		if (o.ok) break;
+		if (!o.bad_key) fail('cannot read the contour: ' + o.err);
+		out('wrong contour password — try again');
+		o = null;
+	}
+	if (!o) fail('wrong contour password');
+	let rid = SU.new_rid();
+	let cl = INV.claim(inv.cid, inv.iid, inv.secret, rid);
+	if (!cl.ok) fail('invite rejected: ' + cl.err);
+	let r = SU.register_router(inv.cid, o.key, inv.repo, inv.gh, { group_id: cl.invite.group, env_id: cl.invite.env }, rid);
+	if (!r.ok) fail(r.err + ' (the invite is used up — create a new one)');
+	out(sprintf('Registered as %s (%s)%s', r.name, r.rid, r.binding ? ', config ' + r.binding : ', no config in this environment yet'));
+	let bacc = r.binding ? C.parse_binding(r.binding).account : null;
+	while (true) {
+		let t = ask('StealthSurf token stlth_… (Enter = skip, router will be a follower): ');
+		if (!t) break;
+		if (!match(t, /^stlth_[a-f0-9]{8}_[a-f0-9]{24}$/)) { out('token format: stlth_<8 hex>_<24 hex>'); continue; }
+		let tc = token_check(t);
+		if (!tc.ok) { out(sprintf('token rejected (HTTP %d) — again or Enter', tc.status)); continue; }
+		if (bacc && tc.account != bacc) out(sprintf('WARNING: token account %d differs from the config account %d — this router will be a FOLLOWER', tc.account, bacc));
+		let label = ask('Token label: ');
+		S.save({ ...S.load(), ss_token: t, ss_account: tc.account, ss_label: label || ('#' + tc.account) });
+		break;
+	}
+	let sec = choose_podkop_section();
+	uci_set('podkop_section', sec);
+	let link = null;
+	if (r.binding) {
+		ST.init(inv.repo, inv.gh, o.key);
+		let rf = ST.get(C.p_rotation(inv.cid, r.binding));
+		if (rf.ok) link = rf.obj.url; else out('WARNING: no current link for this config in the storage yet — it will be applied when available');
+	}
+	wizard_finish(link);
 }
 
 function cmd_wizard() {
@@ -481,9 +527,50 @@ function cmd_config(args) {
 	fail('usage: peers-ss config select [N] | show');
 }
 
+// ---- uninstall (spec §4): files + service + router entry in contour.json; podkop section and its link stay ----
+function cmd_uninstall(args) {
+	if (index(args, '--yes') < 0 && lc(ask('Remove Peers-SS from this router? podkop and its current link stay. [y/N] ') ?? '') != 'y') fail('cancelled');
+	system('/etc/init.d/peers-ss stop >/dev/null 2>&1; /etc/init.d/peers-ss disable >/dev/null 2>&1');
+	if (E.init() && E.refresh_contour()) {
+		let x = E.ctx();
+		let w = ST.update(C.p_contour(x.cid), (c) => {
+			if (!c.routers?.[x.rid]) return null;
+			let n = json(sprintf('%J', c));
+			OPS.remove_router(n, x.rid);
+			OPS.bump(n, x.rid);
+			return n;
+		}, { message: 'contour: ' + C.router_name(x.contour, x.rid) + ' uninstalled' });
+		out(w.ok ? 'Removed ' + C.router_name(x.contour, x.rid) + ' from contour ' + x.cid : 'WARNING: could not update contour.json (' + (w.err ?? '') + ')');
+		let rr = ST.get_raw(C.p_router(x.cid, x.rid));
+		if (rr.ok) ST.delete_raw(C.p_router(x.cid, x.rid), rr.sha, 'router ' + x.rid + ' uninstalled');
+	} else out('WARNING: contour not reachable — remove this router in LuCI → Devices on another router');
+	let pkg = system('opkg status peers-ss 2>/dev/null | grep -q "^Status:.*installed"') == 0;
+	system("sed -i '\\#^/etc/config/peers-ss$#d; \\#^/etc/peers-ss/$#d' /etc/sysupgrade.conf");
+	system('rm -rf /etc/peers-ss /tmp/peers-ss /etc/config/peers-ss /etc/rc.d/*peers-ss /tmp/luci-indexcache* /tmp/luci-modulecache');
+	if (pkg) system('opkg remove peers-ss >/dev/null 2>&1');
+	system('rm -rf /usr/share/peers-ss /usr/share/rpcd/ucode/peers-ss.uc /usr/share/rpcd/acl.d/luci-app-peers-ss.json /usr/share/luci/menu.d/luci-app-peers-ss.json /www/luci-static/resources/view/peers-ss /etc/init.d/peers-ss');
+	system('/etc/init.d/rpcd reload >/dev/null 2>&1');
+	out('Peers-SS removed. podkop section and its current link were not touched.');
+	system('rm -f /usr/bin/peers-ss');
+}
+
+function cmd_invite(args) {
+	let x = need_engine();
+	if (args[0] == 'create') {
+		let r = INV.create(x, args[1] || null, args[2] || null, +(args[3] ?? 24));
+		if (r.error) fail(r.error);
+		out('Invite ' + r.id + ' valid until ' + r.expires_at + ':');
+		out(r.command);
+		return;
+	}
+	if (args[0] == 'revoke') { let r = INV.revoke(x, args[1]); if (r.error) fail(r.error); out('revoked'); return; }
+	for (let i in INV.list(x).invites) out(sprintf('%s %s/%s until %d %s', i.id, i.group ?? 'standalone', i.env ?? 'new',
+		i.expires_at, i.revoked ? 'revoked' : (i.used_by ? 'used by ' + i.used_name : (i.active ? 'active' : 'expired'))));
+}
+
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  invite create <group> [env] [hours] | revoke <id> | list\n  uninstall [--yes]\n  version');
 }
 
 let argv = [...ARGV];
@@ -502,6 +589,8 @@ case 'check': cmd_check(); break;
 case 'rotate': cmd_rotate(argv); break;
 case 'daemon': cmd_daemon(); break;
 case 'wizard': cmd_wizard(); break;
+case 'uninstall': cmd_uninstall(argv); break;
+case 'invite': cmd_invite(argv); break;
 case 'version': out(VERSION); break;
 default: usage(); exit(cmd ? 1 : 0);
 }
