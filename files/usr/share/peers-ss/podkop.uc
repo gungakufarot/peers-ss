@@ -105,6 +105,16 @@ function restart() {
 
 function sing_box_running() { return sh('pidof sing-box').code == 0; }
 
+// after a podkop restart dnsmasq is reconfigured: wait until the router resolves names again (GitHub/API writes follow)
+function wait_dns(max_s) {
+	let t0 = time();
+	while (time() - t0 < (max_s ?? 30)) {
+		if (sh('nslookup api.github.com 127.0.0.1 >/dev/null 2>&1').code == 0) return true;
+		sleep_s(2);
+	}
+	return false;
+}
+
 // layer 4: request through the managed section's mixed proxy
 function tunnel_check(timeout) {
 	let px = mixed_proxy_url();
@@ -221,6 +231,7 @@ function apply_link(link, opts) {
 	log('info', 'podkop: new link written to section ' + name + ', restarting podkop');
 	restart();
 	let up = wait_up(opts.wait ?? 60);
+	wait_dns(30);
 	let res = { changed: true, ok: up };
 	if (!up) {
 		res.err = sprintf('tunnel did not come up in %d s', opts.wait ?? 60);
@@ -271,4 +282,4 @@ function check_podkop() {
 }
 
 export { PODKOP, installed, version, section, proxy_sections, section_ok, create_section, ensure_mixed, listen_address,
-	mixed_proxy_url, current_link, restart, sing_box_running, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev, check_podkop };
+	mixed_proxy_url, current_link, wait_dns, restart, sing_box_running, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev, check_podkop };

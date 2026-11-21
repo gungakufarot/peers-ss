@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# Peers-SS service (procd)
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	[ "$(uci -q get peers-ss.main.enabled)" = "0" ] && return 0
+	procd_open_instance
+	procd_set_param command /usr/bin/peers-ss daemon
+	procd_set_param respawn 3600 10 0
+	procd_set_param stdout 0
+	procd_set_param stderr 1
+	procd_close_instance
+}

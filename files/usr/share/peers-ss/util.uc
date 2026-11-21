@@ -100,6 +100,8 @@ function rand_hex(nbytes) {
 	return hexenc(b);
 }
 
+function rand01() { let b = fs.readfile('/dev/urandom', 2); return (ord(b, 0) * 256 + ord(b, 1)) / 65535.0; }
+
 // parse vless link: host, port, params (never logged)
 function parse_vless(url) {
 	let m = match(url, /^vless:\/\/([^@]+)@(\[[^\]]+\]|[^:\/?#]+):([0-9]+)(\?[^#]*)?(#.*)?$/);
@@ -121,4 +123,4 @@ function median(arr) {
 	return n % 2 ? a[n >> 1] : (a[n / 2 - 1] + a[n / 2]) / 2;
 }
 
-export { RUN, ETC, uniq_name, cleanup_tmp, q, mkdirp, sh, readjson, writefile, writejson, writejson_if_changed, redact, log, set_log_echo, sleep_s, rand_hex, parse_vless, median };
+export { rand01, RUN, ETC, uniq_name, cleanup_tmp, q, mkdirp, sh, readjson, writefile, writejson, writejson_if_changed, redact, log, set_log_echo, sleep_s, rand_hex, parse_vless, median };

@@ -110,7 +110,8 @@ function patch_allowed(config_id) {
 	return false;
 }
 
-function patch_settings(token, cfg, location_id, server_ids) {
+// server_ids: preference list (spec); single: explicit server_id (used when the list did not move the config)
+function patch_settings(token, cfg, location_id, server_ids, single) {
 	if (!patch_allowed(cfg.id)) {
 		log('error', sprintf('PATCH blocked by test_patch_allow for config %d', cfg.id));
 		return { ok: false, status: 0, code: -1, message: 'blocked by test_patch_allow' };
@@ -118,8 +119,9 @@ function patch_settings(token, cfg, location_id, server_ids) {
 	let body = { location_id: +location_id, protocol: cfg.protocol };
 	let f = patch_flags(cfg);
 	for (let k, v in f) if (k != '_source') body[k] = v;
-	if (length(server_ids)) body.server_ids = slice(server_ids, 0, 50);
-	log('info', sprintf('PATCH config %d -> location %d, servers [%s], flags from %s', cfg.id, location_id, join(',', server_ids ?? []), f._source));
+	if (single) body.server_id = +single;
+	else if (length(server_ids)) body.server_ids = slice(server_ids, 0, 50);
+	log('info', sprintf('PATCH config %d -> location %d, %s [%s], flags from %s', cfg.id, location_id, single ? 'server_id' : 'server_ids', single ? single : join(',', server_ids ?? []), f._source));
 	return call(token, 'PATCH', sprintf('/configs/%d/settings', cfg.id), body);
 }
 

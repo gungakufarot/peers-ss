@@ -10,8 +10,12 @@ import * as API from '/usr/share/peers-ss/api.uc';
 import * as P from '/usr/share/peers-ss/ping.uc';
 import * as PK from '/usr/share/peers-ss/podkop.uc';
 import { fp } from '/usr/share/peers-ss/crypto.uc';
+import * as E from '/usr/share/peers-ss/engine.uc';
+import * as SU from '/usr/share/peers-ss/setup.uc';
+import * as ST from '/usr/share/peers-ss/store.uc';
+import * as C from '/usr/share/peers-ss/contour.uc';
 
-const VERSION = '0.1.0';
+const VERSION = E.VERSION;
 U.set_log_echo(false);
 U.cleanup_tmp();
 
@@ -200,9 +204,127 @@ function cmd_podkop(args) {
 	fail('usage: peers-ss podkop status|setup|apply [--force] [--setup]|diag');
 }
 
+// ---- GitHub token / bot key ----
+function cmd_github_token(args) {
+	if (args[0] != 'set') fail('usage: peers-ss github-token set   (token from stdin)');
+	let t = ask('GitHub token (fine-grained, Contents RW on the state repo; shown as typed): ');
+	if (!t || !match(t, /^(github_pat_|ghp_)[A-Za-z0-9_]+$/)) fail('unexpected token format');
+	S.set('gh_token', t);
+	out('GitHub token saved');
+	U.log('info', 'github token replaced');
+}
+
+function need_engine() {
+	if (!E.init()) fail('router is not registered in a contour (run install.sh)');
+	if (!E.refresh_contour()) fail('cannot read contour.json from GitHub: ' + (ST.last_error() ?? ''));
+	return E.ctx();
+}
+
+function cmd_bot_key(args) {
+	if (args[0] != 'set') fail('usage: peers-ss bot-key set   (64 hex from stdin)');
+	let k = ask('Bot key (64 hex): ');
+	if (!match(k ?? '', /^[0-9a-f]{64}$/)) fail('bot key must be 64 hex chars');
+	let x = need_engine();
+	let w = ST.update(C.p_contour(x.cid), (c) => ({ ...c, rev: c.rev + 1, settings: { ...c.settings, bot_key: k } }), { message: 'contour: bot key' });
+	out(w.ok ? 'bot key saved in contour settings' : 'failed: ' + w.err);
+}
+
+// ---- contour (create / dev join) ----
+function ask_password(twice) {
+	let p = ask('Contour password (shown as typed): ');
+	if (!p || length(p) < 8) fail('password: at least 8 characters');
+	if (twice && ask('Repeat password: ') != p) fail('passwords differ');
+	return p;
+}
+
+function cmd_contour(args) {
+	let sub = args[0];
+	if (sub == 'create') {
+		let repo = args[1] ?? fail('usage: peers-ss contour create <owner/repo>');
+		let name = ask('Contour name (e.g. client surname): ');
+		if (!name || length(name) > 32) fail('name: 1-32 characters');
+		let pw = ask_password(true);
+		let bind = uci_get('selected_config');
+		let cfg = null;
+		if (bind) { let id = +split(bind, ':')[1]; for (let c in list_vless(need_token())) if (c.id == id) cfg = c; }
+		let r = SU.create_contour(name, pw, repo, bind, cfg);
+		if (!r.ok) fail(r.err);
+		out(sprintf('Contour created: %s, router openwrt-1 (%s), binding %s', r.cid, r.rid, bind ?? 'none'));
+		return;
+	}
+	if (sub == 'join-dev') {
+		// development helper until invites (stage 8): join group/env directly with repo, contour id and password
+		let repo = args[1], cid = args[2], gid = args[3], eid = args[4];
+		if (!eid) fail('usage: peers-ss contour join-dev <repo> <cid> <group> <env>');
+		let gh = S.get('gh_token') ?? fail('set github-token first');
+		let pw = ask_password(false);
+		let o = SU.open_contour(cid, pw, repo, gh);
+		if (!o.ok) fail(o.err);
+		let r = SU.register_router(cid, o.key, repo, gh, { group_id: gid, env_id: eid });
+		if (!r.ok) fail(r.err);
+		out(sprintf('Registered as %s (%s), binding %s', r.name, r.rid, r.binding ?? 'none'));
+		return;
+	}
+	if (sub == 'show') {
+		let x = need_engine();
+		let c = x.contour;
+		out(sprintf('Contour %s «%s» rev %d, this router: %s (%s), binding %s', x.cid, c.name, c.rev, C.router_name(c, x.rid), x.rid, x.binding ?? '-'));
+		C.each_env(c, (eid, e, gid) => out(sprintf('  %s/%s «%s» config %s routers: %s', gid ?? 'standalone', eid, e.name, e.config ?? '-',
+			join(', ', map(e.routers ?? [], (r) => C.router_name(c, r))))));
+		return;
+	}
+	fail('usage: peers-ss contour create <repo> | show | join-dev <repo> <cid> <group> <env>');
+}
+
+// ---- service ----
+function cmd_status() {
+	let x = need_engine();
+	E.load_state();
+	let s = E.state();
+	out(sprintf('%s (%s) in %s, binding %s, token: %s', C.router_name(x.contour, x.rid), x.rid, x.cid, x.binding ?? '-',
+		x.token ? 'account ' + x.acct : 'none (follower)'));
+	out(sprintf('status: %s, fail counter: %d, ping via vless: %s ms, last check: %s', s.status ?? '-', s.counter ?? 0,
+		s.ping_ms ?? '-', s.last_check ? (ST.now() - s.last_check) + ' s ago' : '-'));
+	if (s.layers) out(sprintf('layers: %J', s.layers));
+	let r = ST.get(C.p_rotation(x.cid, x.binding));
+	if (r.ok) {
+		out(sprintf('rotation file rev %d, lock %s, waiting %s, history %d', r.obj.rev, r.obj.lock ? r.obj.lock.by : 'none',
+			r.obj.waiting ? 'since ' + r.obj.waiting.since : 'no', length(r.obj.history ?? [])));
+		for (let h in slice(r.obj.history ?? [], -3))
+			out(sprintf('  %d by %s: server %s -> %s (%s) %s', h.at, C.router_name(x.contour, h.by), h.from_server, h.to_server, h.location, h.reason));
+	}
+}
+
+function cmd_rotate(args) {
+	need_engine();
+	E.load_state();
+	let dry = index(args, '--dry-run') >= 0;
+	let r = E.rotate({ manual: true, dry_run: dry, reason: dry ? 'dry run' : 'manual' });
+	E.save_state();
+	out(sprintf('%J', r));
+}
+
+function cmd_check() {
+	if (!E.init()) fail('router is not registered in a contour');
+	E.tick();
+	cmd_status();
+}
+
+function cmd_daemon() {
+	U.set_log_echo(false);
+	let interval = 45;
+	while (true) {
+		if (E.init()) {
+			try { E.tick(); } catch (e) { U.log('error', 'tick failed: ' + e); }
+			interval = E.ctx()?.settings?.check_interval_s ?? 45;
+		} else U.log('warn', 'not configured, sleeping');
+		U.sleep_s(interval);
+	}
+}
+
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  version');
 }
 
 let argv = [...ARGV];
@@ -213,6 +335,13 @@ case 'configs': cmd_configs(); break;
 case 'config': cmd_config(argv); break;
 case 'locations': cmd_locations(); break;
 case 'podkop': cmd_podkop(argv); break;
+case 'github-token': cmd_github_token(argv); break;
+case 'bot-key': cmd_bot_key(argv); break;
+case 'contour': cmd_contour(argv); break;
+case 'status': cmd_status(); break;
+case 'check': cmd_check(); break;
+case 'rotate': cmd_rotate(argv); break;
+case 'daemon': cmd_daemon(); break;
 case 'version': out(VERSION); break;
 default: usage(); exit(cmd ? 1 : 0);
 }

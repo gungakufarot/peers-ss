@@ -154,6 +154,15 @@ function get(path, key) {
 	return u;
 }
 
+// last known copy from the RAM cache (used while GitHub is unreachable)
+function get_cached(path, key) {
+	let c = readjson(cache_file(path));
+	if (!c?.text) return { ok: false };
+	let u = unwrap(path, c.text, key);
+	u.sha = c.sha; u.cached = true; u.offline = true;
+	return u;
+}
+
 function put(path, obj, sha, message, key) {
 	let text = wrap(path, obj, key);
 	let w = put_raw(path, text, sha, message);
@@ -189,4 +198,4 @@ function update(path, fn, opts) {
 	return { ok: false, err: 'too many conflicts', conflicts };
 }
 
-export { SCHEMA, init, set_key, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };
+export { get_cached, SCHEMA, init, set_key, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };

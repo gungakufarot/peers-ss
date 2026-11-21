@@ -4,6 +4,22 @@
 import * as fs from 'fs';
 import { RUN, q, mkdirp, sh, uniq_name } from './util.uc';
 
+// Fallback resolver: the router's own DNS goes through podkop's sing-box; if that is down or flaky
+// (curl exit 6) we resolve API/GitHub hosts directly via public resolvers and retry with --resolve.
+const FALLBACK_DNS = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '77.88.8.8'];
+
+function resolve_direct(host) {
+	let cf = RUN + '/dns-' + replace(host, /[^a-z0-9.-]/g, '_');
+	let st = fs.stat(cf);
+	if (st && time() - st.mtime < 600) { let ip = trim(fs.readfile(cf) ?? ''); if (ip) return ip; }
+	for (let srv in FALLBACK_DNS) {
+		let r = sh(sprintf('nslookup %s %s 2>/dev/null | sed -n "/^Name:/,\\$s/^Address[^:]*: *\\([0-9.]*\\)$/\\1/p" | head -1', q(host), srv));
+		let ip = trim(r.out);
+		if (match(ip, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) { fs.writefile(cf, ip); return ip; }
+	}
+	return null;
+}
+
 // opts: { method, headers: {k:v}, body (string), timeout (s), proxy (socks5h://...), connect_timeout }
 // returns { status, headers: {lowercased: value}, body, err }
 function request(url, opts) {
@@ -24,8 +40,12 @@ function request(url, opts) {
 		cmd += ' --data-binary @' + q(inp);
 	}
 	if (opts.proxy) cmd += ' -x ' + q(opts.proxy);
-	cmd += ' ' + q(url);
-	let r = sh(cmd);
+	let r = sh(cmd + ' ' + q(url));
+	if (r.code == 6 && !opts.proxy) {
+		let m = match(url, /^https:\/\/([^\/:]+)(:([0-9]+))?/);
+		let ip = m ? resolve_direct(m[1]) : null;
+		if (ip) r = sh(sprintf('%s --resolve %s %s', cmd, q(m[1] + ':' + (m[3] ?? '443') + ':' + ip), q(url)));
+	}
 	let res = { status: +r.out || 0, headers: {}, body: fs.readfile(out) ?? '', err: r.code ? 'curl exit ' + r.code : null };
 	let raw = fs.readfile(hdr) ?? '';
 	// keep only the last header block (after redirects/100-continue)
@@ -60,4 +80,4 @@ function parse_http_date(s) {
 	return days * 86400 + (+m[4]) * 3600 + (+m[5]) * 60 + (+m[6]);
 }
 
-export { request, json_body, parse_http_date };
+export { request, json_body, parse_http_date, resolve_direct };
