@@ -159,10 +159,16 @@ function engine_lock(wait_s) {
 	let d = U.RUN + '/engine.lock';
 	U.mkdirp(U.RUN);
 	let t0 = time();
+	let mypid = trim(fs.readfile('/proc/self/stat') ?? '0');
+	mypid = split(mypid, ' ')[0];
 	while (true) {
-		if (fs.mkdir(d, 0700)) { LOCK_DEPTH = 1; return true; }
+		if (fs.mkdir(d, 0700)) { fs.writefile(d + '/pid', mypid); LOCK_DEPTH = 1; return true; }
+		// stale: owner process is gone (killed daemon) or lock older than 15 min
+		let owner = trim(fs.readfile(d + '/pid') ?? '');
 		let stt = fs.stat(d);
-		if (stt && time() - stt.mtime > 900) { fs.rmdir(d); continue; }
+		if ((owner && !fs.stat('/proc/' + owner)) || (!owner && stt && time() - stt.mtime > 10) || (stt && time() - stt.mtime > 900)) {
+			fs.unlink(d + '/pid'); fs.rmdir(d); continue;
+		}
 		if (time() - t0 >= (wait_s ?? 0)) return false;
 		U.sleep_s(2);
 	}
@@ -170,6 +176,7 @@ function engine_lock(wait_s) {
 function engine_unlock() {
 	if (LOCK_DEPTH > 1) { LOCK_DEPTH--; return; }
 	LOCK_DEPTH = 0;
+	fs.unlink(U.RUN + '/engine.lock/pid');
 	fs.rmdir(U.RUN + '/engine.lock');
 }
 
@@ -228,6 +235,7 @@ function lock_take(binding, opts, cur_link) {
 		let last = o.history?.[-1]?.at ?? 0;
 		if (!opts.manual && !opts.retry && now - last < X.settings.retry_min * 60) { res = 'too_soon'; return null; }
 		if (!opts.manual && o.waiting && now < o.waiting.next_try) { res = 'waiting'; return null; }
+		if (opts.retry && !o.waiting) { res = 'too_soon'; return null; }   // waiting already over (someone recovered)
 		return { ...o, lock: { by: X.rid, until: now + LOCK_TTL } };
 	}, { message: 'lock ' + binding });
 	if (!w.ok) return { ok: false, why: 'github' };
@@ -467,12 +475,15 @@ function rotate_inner(opts) {
 	// waiting mode (spec: candidates failed / none available): one router retries every retry_min through the lock
 	let retry = X.settings.retry_min * 60;
 	st.waiting_until = ST.now() + retry;
-	if (!opts.nolock) write_rotation(binding, (n) => {
-		n.waiting = { since: n.waiting?.since ?? ST.now(), next_try: ST.now() + retry, attempts: (n.waiting?.attempts ?? 0) + attempts };
-		n.blacklist = { ...blacklisted(n, ST.now()) };
-		for (let s in tried) n.blacklist['' + s] = ST.now() + BLACKLIST_S;
-		if (n.lock?.by == X.rid) n.lock = null;
-	}, 'rotation: waiting mode');
+	if (!opts.nolock) {
+		let ww = write_rotation(binding, (n) => {
+			n.waiting = { since: n.waiting?.since ?? ST.now(), next_try: ST.now() + retry, attempts: (n.waiting?.attempts ?? 0) + attempts };
+			n.blacklist = { ...blacklisted(n, ST.now()) };
+			for (let s in tried) n.blacklist['' + s] = ST.now() + BLACKLIST_S;
+			if (n.lock?.by == X.rid) n.lock = null;
+		}, 'rotation: waiting mode');
+		if (ww.ok) st.rot = { rev: ww.obj.rev, waiting: ww.obj.waiting, updated_at: ww.obj.updated_at };
+	}
 	st.status = 'waiting';
 	save_state();
 	alert('waiting-' + replace(binding, ':', '-'), sprintf('Ротация не помогает (кандидатов: %d) — режим ожидания: техработы или массовая блокировка. Повтор каждые %d мин.', attempts, X.settings.retry_min));
@@ -712,9 +723,16 @@ function tick_inner() {
 		PK.restart();
 	}
 	else if (h.verdict == 'ok') {
+		let was_blocked = !!st.episode;
 		st.counter = 0;
 		delete st.episode;
+		delete st.waiting_until;
 		st.status = 'ok';
+		// link works again: leave waiting mode (any token router)
+		if (gh_ok && was_blocked && st.rot?.waiting && my_token_fits(X.binding)) {
+			let w = write_rotation(X.binding, (n) => { n.waiting = null; }, 'rotation: waiting mode over');
+			if (w.ok) { st.rot.waiting = null; U.log('info', 'waiting mode over: link works'); }
+		}
 		if (now_m - (st.lat_mono ?? 0) > 1800) { let l = PK.latency(); if (l.ms) { st.ping_ms = l.ms; st.ping_at = ST.now(); } st.lat_mono = now_m; }
 	}
 	else if (h.verdict == 'fail') {
@@ -749,7 +767,6 @@ function tick_inner() {
 				let retry = st.rot?.waiting && ST.now() >= st.rot.waiting.next_try;
 				let r = rotate({ reason: retry ? 'retry (waiting)' : 'blocked', retry });
 				if (r.action != 'too_soon' && r.action != 'waiting') U.log('info', 'rotation result: ' + r.action + (r.err ? ' — ' + r.err : ''));
-				if (retry) { let q = rot_get(); if (q.ok) st.rot = { rev: q.obj.rev, waiting: q.obj.waiting }; }
 			} else follower_report(X.binding);
 		}
 		save_state();

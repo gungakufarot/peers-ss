@@ -193,15 +193,18 @@ function diagnostics() {
 function lock() {
 	let d = RUN + '/podkop.lock';
 	mkdirp(RUN);
+	let mypid = split(trim(fs.readfile('/proc/self/stat') ?? '0'), ' ')[0];
 	for (let i = 0; i < 120; i++) {
-		if (fs.mkdir(d, 0700)) return true;
-		let st = fs.stat(d);
-		if (st && time() - st.mtime > 300) { fs.rmdir(d); continue; }
+		if (fs.mkdir(d, 0700)) { fs.writefile(d + '/pid', mypid); return true; }
+		let owner = trim(fs.readfile(d + '/pid') ?? ''), st = fs.stat(d);
+		if ((owner && !fs.stat('/proc/' + owner)) || (!owner && st && time() - st.mtime > 10) || (st && time() - st.mtime > 300)) {
+			fs.unlink(d + '/pid'); fs.rmdir(d); continue;
+		}
 		sleep_s(1);
 	}
 	return false;
 }
-function unlock() { fs.rmdir(RUN + '/podkop.lock'); }
+function unlock() { fs.unlink(RUN + '/podkop.lock/pid'); fs.rmdir(RUN + '/podkop.lock'); }
 
 // spec §7 apply cycle. returns { changed, ok, diag, latency, err, rolled_back }
 // opts: { force, diag (default true), setup (create section if missing), restore (do not overwrite prev), wait }
