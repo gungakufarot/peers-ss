@@ -17,3 +17,4 @@
 - Секреты лежат вне репозитория (`/root/peers-ss-secrets*.env`). Перед каждым коммитом — `git status` и проверка, что секретов в коммите нет.
 - Сервер бота: не трогать ничего, кроме своей службы `peers-ss-bot` и папок `/opt/peers-ss-bot`, `/etc/peers-ss-bot`.
 - Spaceship MCP не использовать. telegram-mcp — только переписка с тестовым ботом.
+- Хук `tools/leak-scan.sh` (pre-commit) сверяет индекс со значениями секретов: `ln -sf ../../tools/leak-scan.sh .git/hooks/pre-commit`.
