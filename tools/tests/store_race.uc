@@ -3,11 +3,11 @@
 import * as S from '/usr/share/peers-ss/secrets.uc';
 import * as ST from '/usr/share/peers-ss/store.uc';
 import { kdf } from '/usr/share/peers-ss/crypto.uc';
-let who = ARGV[0], n = +ARGV[1];
+let who = ARGV[0], n = +ARGV[1], file = ARGV[2] ?? 'test-stage3/race.json';
 ST.init('gungakufarot/peers-ss-state', S.get('gh_token'), kdf('stage3-test-password', '00112233445566778899aabbccddeeff', 2000));
 let total_conf = 0;
 for (let i = 1; i <= n; i++) {
-	let r = ST.update('test-stage3/race.json', (o) => {
+	let r = ST.update(file, (o) => {
 		o ??= { entries: [] };
 		push(o.entries, who + '-' + i);
 		return o;

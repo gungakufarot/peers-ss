@@ -160,7 +160,7 @@ function selected_cfg() {
 
 function print_apply(r) {
 	out(sprintf('changed: %s, ok: %s%s', r.changed, r.ok, r.err ? ', error: ' + r.err : ''));
-	if (r.diag) out('diagnostics: ' + (r.diag.ok ? 'green' : 'FAIL ' + join(',', r.diag.fails)));
+	if (r.diag) out('diagnostics: ' + (r.diag.ok ? 'green' : 'FAIL ' + join(',', r.diag.fails)) + (length(r.diag.warnings ?? []) ? ' (warnings: ' + join(',', r.diag.warnings) + ')' : ''));
 	if (r.latency) out(sprintf('latency via vless: %s ms (%s)', r.latency.ms ?? 'n/a', r.latency.method));
 }
 
@@ -177,15 +177,14 @@ function cmd_podkop(args) {
 		return;
 	}
 	if (sub == 'setup') {
-		let name = PK.section();
-		let created = PK.create_section(name), mixed = PK.ensure_mixed(name);
-		out(sprintf('section %s: %s; mixed proxy: %s (not applied until a link is set)', name, created ? 'created' : 'exists', mixed ? 'enabled' : 'already on'));
+		// section is created together with the first link in one commit (peers-ss podkop apply --setup)
+		out(sprintf('%J', PK.check_podkop()));
 		return;
 	}
 	if (sub == 'apply') {
 		let c = selected_cfg();
 		let t0 = time();
-		let r = PK.apply_link(c.connection_url, { force: args[1] == '--force' });
+		let r = PK.apply_link(c.connection_url, { force: index(args, '--force') >= 0, setup: index(args, '--setup') >= 0 });
 		print_apply(r);
 		out(sprintf('took %ds', time() - t0));
 		return;
@@ -198,12 +197,12 @@ function cmd_podkop(args) {
 		out('tunnel (layer 4): ' + (PK.tunnel_check().ok ? 'ok' : 'FAIL'));
 		return;
 	}
-	fail('usage: peers-ss podkop status|setup|apply [--force]|diag');
+	fail('usage: peers-ss podkop status|setup|apply [--force] [--setup]|diag');
 }
 
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force]|diag\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  version');
 }
 
 let argv = [...ARGV];

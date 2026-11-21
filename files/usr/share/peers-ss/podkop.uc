@@ -13,6 +13,9 @@ const PODKOP = '/usr/bin/podkop';
 const TEST_URL = 'https://www.gstatic.com/generate_204';
 const DEFAULT_MIXED_PORT = 2080;
 
+// private uci delta dir: we never commit changes an admin staged in LuCI (/tmp/.uci)
+function ucur() { mkdirp(RUN + '/uci'); return cursor(null, RUN + '/uci'); }
+
 function section() { return cursor().get('peers-ss', 'main', 'podkop_section') ?? 'peers_ss'; }
 
 function installed() { return fs.access(PODKOP, 'x') && fs.access('/etc/init.d/podkop'); }
@@ -46,8 +49,7 @@ function used_ports() {
 }
 
 // create the managed proxy section (spec §4 A.6) — only if it does not exist
-function create_section(name) {
-	let c = cursor();
+function create_section(name, c) {
 	if (c.get('podkop', name) != null) return false;
 	let used = used_ports(), port = DEFAULT_MIXED_PORT;
 	while (used['' + port]) port++;
@@ -57,19 +59,16 @@ function create_section(name) {
 	c.set('podkop', name, 'enable_udp_over_tcp', '0');
 	c.set('podkop', name, 'mixed_proxy_enabled', '1');
 	c.set('podkop', name, 'mixed_proxy_port', '' + port);
-	c.save('podkop');
 	return true;
 }
 
 // spec §7: enable mixed proxy of the managed section for tunnel checks
-function ensure_mixed(name) {
-	let c = cursor();
+function ensure_mixed(name, c) {
 	if (c.get('podkop', name, 'mixed_proxy_enabled') == '1' && c.get('podkop', name, 'mixed_proxy_port')) return false;
 	let used = used_ports(), port = DEFAULT_MIXED_PORT;
 	while (used['' + port]) port++;
 	c.set('podkop', name, 'mixed_proxy_enabled', '1');
 	if (!c.get('podkop', name, 'mixed_proxy_port')) c.set('podkop', name, 'mixed_proxy_port', '' + port);
-	c.save('podkop');
 	return true;
 }
 
@@ -116,23 +115,27 @@ function tunnel_check(timeout) {
 
 // spec §7 step 4: up to 60 s, every 5 s: sing-box up and layer 4 passes
 function wait_up(max_s) {
-	let t = 0;
+	let t0 = time();
 	max_s ??= 60;
 	sleep_s(3);
-	while (t < max_s) {
-		if (sing_box_running() && tunnel_check(6).ok) return true;
+	while (time() - t0 < max_s) {
+		if (sing_box_running() && tunnel_check(min(6, max(2, max_s - (time() - t0)))).ok) return true;
 		sleep_s(5);
-		t += 5;
 	}
 	return false;
 }
 
 // spec §7 step 6: latency via Clash API (sing-box URL test); fallback: median of 3 requests via mixed proxy
 function latency() {
-	let r = sh(sprintf('%s clash_api get_proxy_latency %s 5000', PODKOP, q(section() + '-out')));
-	let j = null;
-	try { j = json(r.out); } catch (e) {}
-	if (j?.delay > 0) return { ms: j.delay, method: 'clash' };
+	// first URL test warms the connection; then median of 3
+	let d = [];
+	for (let i = 0; i < 4; i++) {
+		let r = sh(sprintf('%s clash_api get_proxy_latency %s 5000', PODKOP, q(section() + '-out')));
+		let j = null;
+		try { j = json(r.out); } catch (e) {}
+		if (i > 0 && j?.delay > 0) push(d, j.delay);
+	}
+	if (length(d)) return { ms: int(median(d)), method: 'clash' };
 	let px = mixed_proxy_url(), t = [];
 	if (px) for (let i = 0; i < 3; i++) {
 		let c = sh(sprintf('curl -s -o /dev/null -m 8 -x %s -w "%%{http_code} %%{time_total}" %s', q(px), q(TEST_URL)));
@@ -164,7 +167,9 @@ function diagnostics() {
 	req1(d.dns, ['dns_status', 'dns_on_router', 'bootstrap_dns_status', 'dhcp_config_status'], 'dns');
 	req1(d.sing_box, ['sing_box_installed', 'sing_box_version_ok', 'sing_box_service_exist', 'sing_box_autostart_disabled', 'sing_box_process_running', 'sing_box_ports_listening'], 'sing_box');
 	// counters may legitimately be 0 when no traffic went through yet (RECON)
-	req1(d.nft, ['table_exist', 'rules_mangle_exist', 'rules_mangle_output_exist', 'rules_proxy_exist', 'rules_other_mark_exist'], 'nft');
+	req1(d.nft, ['table_exist', 'rules_mangle_exist', 'rules_mangle_output_exist', 'rules_proxy_exist'], 'nft');
+	// LuCI: rules_other_mark_exist=1 is only a warning ("additional marking rules found"), 0 is fine
+	d.warnings = (d.nft?.rules_other_mark_exist === 1) ? ['nft:other_mark_rules'] : [];
 	req1(d.fakeip, ['fakeip'], 'fakeip');
 	let lat = pj(sprintf('clash_api get_proxy_latency %s 5000', q(section() + '-out')));
 	if (!(lat?.delay > 0)) push(fails, 'outbound:latency');
@@ -174,42 +179,96 @@ function diagnostics() {
 	return d;
 }
 
-// spec §7 apply cycle. returns { changed, ok, diag, latency, err }
+// single-writer lock around podkop changes (CLI, service and rpcd may race); stale after 300 s
+function lock() {
+	let d = RUN + '/podkop.lock';
+	mkdirp(RUN);
+	for (let i = 0; i < 120; i++) {
+		if (fs.mkdir(d, 0700)) return true;
+		let st = fs.stat(d);
+		if (st && time() - st.mtime > 300) { fs.rmdir(d); continue; }
+		sleep_s(1);
+	}
+	return false;
+}
+function unlock() { fs.rmdir(RUN + '/podkop.lock'); }
+
+// spec §7 apply cycle. returns { changed, ok, diag, latency, err, rolled_back }
+// opts: { force, diag (default true), setup (create section if missing), restore (do not overwrite prev), wait }
 function apply_link(link, opts) {
 	opts ??= {};
 	if (type(link) != 'string' || substr(link, 0, 8) != 'vless://' || length(link) < 20)
 		return { changed: false, ok: false, err: 'not a vless link' };
 	let name = section();
-	if (!section_ok(name)) return { changed: false, ok: false, err: 'podkop section missing: ' + name, podkop_changed: true };
-	let cur = current_link();
+	let c = ucur();
+	if (c.get('podkop', name) == null && !opts.setup)
+		return { changed: false, ok: false, err: 'podkop section missing: ' + name, podkop_changed: true };
+	if (c.get('podkop', name) != null && !section_ok(name))
+		return { changed: false, ok: false, err: 'podkop section is not a url proxy section: ' + name, podkop_changed: true };
+	let cur = c.get('podkop', name, 'proxy_string');
 	if (cur == link && !opts.force) return { changed: false, ok: true };
+	if (!lock()) return { changed: false, ok: false, err: 'podkop is locked by another apply' };
 	backup_orig();
 	mkdirp(RUN);
-	if (cur) writefile(RUN + '/podkop.prev', cur, 0600);
-	let c = cursor();
+	if (cur && !opts.restore) writefile(RUN + '/podkop.prev', cur, 0600);
+	c = ucur();
+	c.revert('podkop');
+	create_section(name, c);
+	ensure_mixed(name, c);
 	c.set('podkop', name, 'proxy_config_type', 'url');
 	c.set('podkop', name, 'proxy_string', link);
-	c.save('podkop');
 	c.commit('podkop');
 	log('info', 'podkop: new link written to section ' + name + ', restarting podkop');
 	restart();
 	let up = wait_up(opts.wait ?? 60);
 	let res = { changed: true, ok: up };
-	if (!up) { res.err = 'tunnel did not come up in 60 s'; return res; }
+	if (!up) {
+		res.err = sprintf('tunnel did not come up in %d s', opts.wait ?? 60);
+		// LAN safety: if sing-box itself is down, dnsmasq points to a dead resolver — go back
+		if (!sing_box_running()) {
+			let prev = opts.restore ? null : fs.readfile(RUN + '/podkop.prev');
+			unlock();
+			if (prev && prev != link) {
+				log('error', 'podkop: sing-box down after apply, restoring previous link');
+				apply_link(prev, { force: true, diag: false, restore: true });
+			}
+			if (!sing_box_running()) {
+				log('error', 'podkop: sing-box still down, stopping podkop to restore dnsmasq');
+				sh('/etc/init.d/podkop stop');
+			}
+			res.rolled_back = true;
+			return res;
+		}
+		unlock();
+		return res;
+	}
 	if (opts.diag !== false) {
 		res.diag = diagnostics();
 		res.ok = res.diag.ok;
 		if (!res.ok) res.err = 'diagnostics: ' + join(',', res.diag.fails);
 	}
 	res.latency = latency();
+	unlock();
 	return res;
 }
 
-// roll back to the previous link (used when diagnostics of a new link fail and no candidate is left)
+// back to the link that was active before the last apply
 function restore_prev() {
 	let prev = fs.readfile(RUN + '/podkop.prev');
-	return prev ? apply_link(prev, { force: true, diag: false }) : null;
+	return prev ? apply_link(prev, { force: true, diag: false, restore: true }) : null;
+}
+
+// spec §7: at service start check that podkop still has our section and option
+function check_podkop() {
+	if (!installed()) return { ok: false, reason: 'podkop not installed' };
+	let v = version();
+	let name = section();
+	if (cursor().get('podkop', name) == null) return { ok: false, reason: 'section ' + name + ' missing', version: v };
+	if (!section_ok(name)) return { ok: false, reason: 'section ' + name + ' is not proxy/url', version: v };
+	let code = fs.readfile('/usr/bin/podkop') ?? '';
+	if (index(code, 'proxy_string') < 0) return { ok: false, reason: 'podkop does not know proxy_string', version: v };
+	return { ok: true, version: v, version_tested: match(v, /0\.7\.24/) != null };
 }
 
 export { PODKOP, installed, version, section, proxy_sections, section_ok, create_section, ensure_mixed, listen_address,
-	mixed_proxy_url, current_link, restart, sing_box_running, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev };
+	mixed_proxy_url, current_link, restart, sing_box_running, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev, check_podkop };
