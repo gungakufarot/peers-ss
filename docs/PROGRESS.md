@@ -3,7 +3,7 @@
 Обновляется после каждого этапа. По этому файлу работу можно продолжить без участия владельца.
 
 ## Где сейчас
-Подготовка завершена. Следующий шаг: этап 0 (установка podkop 0.7.24 на роутер 1), затем этап 1 — разведка.
+Этапы 0–1 завершены. Текущий: **этап 2** — клиент API StealthSurf (только чтение): CLI `peers-ss configs`, выбор по номеру, пинг локаций ≤10 с.
 
 ## Сделано
 - `.gitignore`, `AGENTS.md`, `CLAUDE.md`; публичный репозиторий `gungakufarot/peers-ss`.
@@ -24,6 +24,9 @@
 - Токен GitHub: проверено действиями — только Contents (admin-запросы → 403).
 - Секреты: сейчас `/root/peers-ss-secrets.env` (свободный текст); позже владелец создаст `/root/peers-ss-secrets-end.env` в формате KEY=VALUE
   (`STEALTHSURF_API_KEY`, `GITHUB_STATE_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`, `CONTOUR_PASSWORD`, `STATE_REPO`). Скрипты читают его, если он есть.
+
+- Этап 0: podkop 0.7.24 на роутере 1 (отчёт `docs/reports/stage-0.md`).
+- Этап 1: разведка → `docs/RECON.md`, отчёт `docs/reports/stage-1.md`.
 
 ## Дальше
 Этапы 0 → 10 по разделу 11 ТЗ.
