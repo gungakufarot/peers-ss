@@ -24,6 +24,7 @@ const OFFLINE_S = 3600;
 const BAD_WINDOW = 1800, BAD_IGNORE = 3600;
 
 let X = null;      // context
+let START_MONO = null;   // monotonic start of this process (GitHub-down timer)
 let st = null;     // local volatile state (RAM)
 
 function load_state() { st = U.readjson(STATE) ?? { counter: 0 }; return st; }
@@ -43,6 +44,7 @@ function init() {
 	if (!X.rid || !X.cid || !X.repo || !X.key || !X.gh) return false;
 	ST.init(X.repo, X.gh, X.key);
 	load_state();
+	START_MONO ??= ST.mono();
 	return true;
 }
 
@@ -124,7 +126,7 @@ function first_token_router(binding, recs) {
 	for (let rid in C.binding_routers(X.contour, binding)) {
 		let rec = rid == X.rid ? router_record() : recs[rid];
 		if (!rec) continue;
-		let fresh = rid == X.rid || now - (rec.last_contact ?? 0) < OFFLINE_S;
+		let fresh = rid == X.rid || now - (rec.last_contact ?? 0) < HEARTBEAT_S + 300;
 		if (fresh && rec.has_token && +rec.account == b.account) return rid;
 	}
 	return null;
@@ -150,15 +152,58 @@ function apply_link(url, why) {
 	return r;
 }
 
-// poll rotations/… and apply a newer link (spec §5 "Остальные роутеры")
+// ---------- local (per-router) engine lock: daemon tick, CLI check/rotate, rpcd must not overlap ----------
+let LOCK_DEPTH = 0;
+function engine_lock(wait_s) {
+	if (LOCK_DEPTH > 0) { LOCK_DEPTH++; return true; }
+	let d = U.RUN + '/engine.lock';
+	U.mkdirp(U.RUN);
+	let t0 = time();
+	while (true) {
+		if (fs.mkdir(d, 0700)) { LOCK_DEPTH = 1; return true; }
+		let stt = fs.stat(d);
+		if (stt && time() - stt.mtime > 900) { fs.rmdir(d); continue; }
+		if (time() - t0 >= (wait_s ?? 0)) return false;
+		U.sleep_s(2);
+	}
+}
+function engine_unlock() {
+	if (LOCK_DEPTH > 1) { LOCK_DEPTH--; return; }
+	LOCK_DEPTH = 0;
+	fs.rmdir(U.RUN + '/engine.lock');
+}
+
+function blacklisted(o, now) {
+	let b = {};
+	for (let sid, until in o?.blacklist ?? {}) if (until > now) b[sid] = until;
+	return b;
+}
+function blacklisted_any(o, now) { return blacklisted(o, now); }
+
+// API answers for GET /configs may be cached up to 300 s (spec §6): right after a rotation the API can still
+// return the old (blocked) link. Such a link must never be adopted.
+const API_CACHE_S = 330;
+function api_link_trusted(cfg, rot) {
+	let now = ST.now();
+	let last = max(rot?.updated_at ?? 0, rot?.history?.[-1]?.at ?? 0, st.last_rotation?.at ?? 0);
+	if (now - last < API_CACHE_S) return false;
+	if (blacklisted_any(rot, now)['' + cfg.server_id]) return false;
+	if ((st.own_bl?.['' + cfg.server_id] ?? 0) > now) return false;
+	return true;
+}
+
+// poll rotations/… and apply a revision newer than the applied one (spec §5 "Остальные роутеры")
 function deliver() {
-	if (!X.binding) return;
+	if (!X.binding || st.pending_writeback) return;
 	let r = rot_get();
 	if (!r.ok) return;
-	st.rot = { rev: r.obj.rev, waiting: r.obj.waiting };
-	if (r.obj.url && r.obj.url != PK.current_link()) {
+	st.rot = { rev: r.obj.rev, waiting: r.obj.waiting, updated_at: r.obj.updated_at };
+	let cur = PK.current_link();
+	if (r.obj.url && r.obj.url == cur) { st.applied_rev = r.obj.rev; return; }
+	if (r.obj.url && (r.obj.rev ?? 0) > (st.applied_rev ?? -1)) {
 		if (st.status == 'update_required') return;
-		apply_link(r.obj.url, 'rotations rev ' + r.obj.rev);
+		let a = apply_link(r.obj.url, 'rotations rev ' + r.obj.rev);
+		if (a.changed || a.ok) st.applied_rev = r.obj.rev;
 	}
 }
 
@@ -173,16 +218,31 @@ function rot_release(binding) {
 	return false;
 }
 
-function lock_take(binding) {
+// takes the lock and re-checks (inside the CAS) everything that another router may have changed
+function lock_take(binding, opts, cur_link) {
 	let now = ST.now(), res = null;
 	let w = ST.update(rot_path(binding), (o) => {
 		o ??= { rev: 0, binding, history: [], blacklist: {}, reports: {}, triggers: {} };
 		if (o.lock && o.lock.by != X.rid && o.lock.until > now) { res = 'busy'; return null; }
+		if (o.url && o.url != cur_link && (o.rev ?? 0) > (st.applied_rev ?? -1)) { res = 'newer'; return null; }
+		let last = o.history?.[-1]?.at ?? 0;
+		if (!opts.manual && !opts.retry && now - last < X.settings.retry_min * 60) { res = 'too_soon'; return null; }
+		if (!opts.manual && o.waiting && now < o.waiting.next_try) { res = 'waiting'; return null; }
 		return { ...o, lock: { by: X.rid, until: now + LOCK_TTL } };
 	}, { message: 'lock ' + binding });
 	if (!w.ok) return { ok: false, why: 'github' };
-	if (res == 'busy') return { ok: false, why: 'busy', obj: w.obj };
-	return { ok: true, obj: w.obj };
+	if (res) return { ok: false, why: res, obj: w.obj };
+	return { ok: true, obj: w.obj, taken_mono: ST.mono() };
+}
+
+// extend our lock before each PATCH; false if we lost it
+function lock_renew(binding) {
+	let lost = false, now = ST.now();
+	let w = ST.update(rot_path(binding), (o) => {
+		if (!o?.lock || o.lock.by != X.rid) { lost = true; return null; }
+		return { ...o, lock: { by: X.rid, until: now + LOCK_TTL } };
+	}, { message: 'lock renew' });
+	return w.ok && !lost;
 }
 
 // wait up to 3 min for someone else's new link
@@ -191,7 +251,11 @@ function wait_new_link(binding, max_s) {
 	while (ST.mono() - t0 < (max_s ?? 180)) {
 		U.sleep_s(10);
 		let r = rot_get(binding);
-		if (r.ok && r.obj.url && r.obj.url != cur) { apply_link(r.obj.url, 'rotation by ' + (r.obj.lock?.by ?? r.obj.history?.[-1]?.by ?? '?')); return true; }
+		if (r.ok && r.obj.url && r.obj.url != cur) {
+			apply_link(r.obj.url, 'rotation by ' + (r.obj.lock?.by ?? r.obj.history?.[-1]?.by ?? '?'));
+			st.applied_rev = r.obj.rev;
+			return true;
+		}
 		if (r.ok && !r.obj.lock) return false;
 	}
 	return false;
@@ -213,12 +277,6 @@ function write_rotation(binding, mutate, msg) {
 	}, { message: msg ?? ('rotation ' + binding) });
 }
 
-function blacklisted(o, now) {
-	let b = {};
-	for (let sid, until in o?.blacklist ?? {}) if (until > now) b[sid] = until;
-	return b;
-}
-
 // rank candidate locations: reporter pings (follower) or own measurement
 function ranked_locations(locs, ext) {
 	if (ext && length(ext)) {
@@ -231,10 +289,15 @@ function ranked_locations(locs, ext) {
 	return P.rank_locations(locs);
 }
 
-// opts: { reason, manual, dry_run, ext_pings, nolock }
-// returns { ok, action: applied|recovered|rotated|locked|waiting|error|dry_run, ... }
-function rotate(opts) {
-	opts ??= {};
+function apply_candidate(url) {
+	let ar = apply_link(url, 'own rotation');
+	if (!ar.ok && match(ar.err ?? '', /locked/)) { U.sleep_s(15); ar = apply_link(url, 'own rotation (retry)'); }
+	return ar;
+}
+
+// opts: { reason, manual, dry_run, ext_pings, nolock, retry, for_report }
+// returns { ok, action: applied|recovered|rotated|locked|too_soon|waiting|error|dry_run|busy, ... }
+function rotate_inner(opts) {
 	let binding = X.binding;
 	if (!binding) return { ok: false, action: 'error', err: 'no binding' };
 	let b = C.parse_binding(binding);
@@ -242,33 +305,38 @@ function rotate(opts) {
 	let now = ST.now();
 	let cur_link = PK.current_link();
 
-	// 1. newer link already in the file
+	// 1. newer revision already in the file
 	let rf = opts.nolock ? null : rot_get(binding);
-	if (rf?.ok && rf.obj.url && rf.obj.url != cur_link && !opts.dry_run) {
+	if (rf?.ok && rf.obj.url && rf.obj.url != cur_link && (rf.obj.rev ?? 0) > (st.applied_rev ?? -1) && !opts.dry_run) {
 		apply_link(rf.obj.url, 'rotation file newer');
+		st.applied_rev = rf.obj.rev;
 		return { ok: true, action: 'applied' };
 	}
+	if (!opts.manual && !opts.dry_run && rf?.ok && rf.obj.waiting && now < rf.obj.waiting.next_try)
+		return { ok: false, action: 'waiting', err: 'next try in ' + (rf.obj.waiting.next_try - now) + ' s' };
 	// 10-minute rule (normal mode)
-	let last = rf?.ok ? (rf.obj.history?.[-1]?.at ?? 0) : 0;
+	let last = rf?.ok ? (rf.obj.history?.[-1]?.at ?? 0) : max(st.last_rotation?.at ?? 0, 0);
 	if (!opts.manual && !opts.dry_run && !opts.retry && now - last < X.settings.retry_min * 60)
 		return { ok: false, action: 'too_soon', err: 'last rotation ' + (now - last) + ' s ago' };
 
 	// 2. lock
+	let lock_mono = ST.mono();
 	if (!opts.nolock && !opts.dry_run) {
-		let l = lock_take(binding);
+		let l = lock_take(binding, opts, cur_link);
 		if (!l.ok) {
 			if (l.why == 'busy') {
 				U.log('info', 'rotation lock held by ' + l.obj.lock.by + ', waiting for new link');
 				return { ok: wait_new_link(binding), action: 'locked' };
 			}
-			return { ok: false, action: 'error', err: 'cannot take lock (GitHub)' };
+			if (l.why == 'newer') { apply_link(l.obj.url, 'rotation file newer'); st.applied_rev = l.obj.rev; return { ok: true, action: 'applied' }; }
+			if (l.why == 'github') return { ok: false, action: 'error', err: 'cannot take lock (GitHub)' };
+			return { ok: false, action: l.why };
 		}
 		rf = { ok: true, obj: l.obj };
 	}
 	let release = () => { if (!opts.nolock && !opts.dry_run) rot_release(binding); };
 
-	// 3. re-check layers 3-4
-	// skipped when rotating for a follower's report: the block is at the reporter, not here (bad-channel rule guards it)
+	// 3. re-check layers 3-4 (skipped for a follower's report: the block is there, the bad-channel rule guards it)
 	if (!opts.manual && !opts.dry_run && !opts.for_report && H.recheck(cur_link)) {
 		U.log('info', 'recheck passed — no rotation');
 		release();
@@ -286,13 +354,18 @@ function rotate(opts) {
 	}
 	let cfg = fc.cfg;
 	if (cfg.connection_url != cur_link && !opts.dry_run && !opts.manual) {
-		U.log('info', 'API link differs from mine (changed in console / other contour) — taking it');
-		write_rotation(binding, (n) => {
-			n.rev = (n.rev ?? 0) + 1; n.url = cfg.connection_url; n.server_id = cfg.server_id; n.location_id = cfg.location_id;
-			n.lock = null; n.updated_at = ST.now();
-		}, 'rotation: link from API');
-		apply_link(cfg.connection_url, 'API link');
-		return { ok: true, action: 'applied_api' };
+		if (api_link_trusted(cfg, rf?.obj)) {
+			U.log('info', 'API link differs from mine (changed in console / other contour) — taking it');
+			let w = write_rotation(binding, (n) => {
+				n.rev = (n.rev ?? 0) + 1; n.url = cfg.connection_url; n.server_id = cfg.server_id; n.location_id = cfg.location_id;
+				n.lock = null; n.updated_at = ST.now();
+			}, 'rotation: link from API');
+			apply_link(cfg.connection_url, 'API link');
+			if (w.ok) st.applied_rev = w.obj.rev;
+			return { ok: true, action: 'applied_api' };
+		}
+		U.log('info', 'API link differs but may be a cached (stale) answer — ignored');
+		cfg = { ...cfg, connection_url: cur_link ?? cfg.connection_url, server_id: rf?.obj?.server_id ?? cfg.server_id };
 	}
 
 	// 5. locations ranked by ping (from the router that saw the block)
@@ -302,12 +375,14 @@ function rotate(opts) {
 	let ranked = filter(ranked_locations(locs, opts.ext_pings), (x) => x.ms != null);
 	let vport = U.parse_vless(cfg.connection_url)?.port;
 	let bl = blacklisted(rf?.obj, now);
+	for (let sid, until in st.own_bl ?? {}) if (until > now) bl[sid] = until;
 	bl['' + cfg.server_id] = now + BLACKLIST_S;
 
+	let max_cand = opts.retry ? 1 : 3;
 	let attempts = 0, patches = 0, tried = [], old_server = cfg.server_id, plan = [];
 	let old_host = U.parse_vless(cfg.connection_url)?.host;
 	let li = 0;
-	while (attempts < 3 && patches < 6 && li < length(ranked)) {
+	while (attempts < max_cand && patches < 6 && li < length(ranked)) {
 		let loc = ranked[li].loc;
 		// 6. servers of the best location
 		let av = API.available_servers(X.token, loc.id, cfg.protocol);
@@ -319,15 +394,18 @@ function rotate(opts) {
 		if (!length(ids)) ids = map(rs, (x) => x.server.id);
 		push(plan, { location: loc.code, location_id: loc.id, loc_ms: ranked[li].ms, servers: map(rs, (x) => [x.server.id, x.ms]) });
 		if (opts.dry_run) { li++; if (length(plan) >= 3) break; continue; }
-		// 7. PATCH: preference list first; if the service kept the same server — explicit server_id once
+		// 7. PATCH (lock renewed first; abort if lost). Preference list; if the service kept the same server — explicit server_id once
 		let pr = null, moved = false;
 		for (let mode in ['list', 'single']) {
+			if (!opts.nolock && (!lock_renew(binding) || ST.mono() - lock_mono > 600)) {
+				U.log('warn', 'rotation lock lost — stopping this rotation');
+				return { ok: false, action: 'error', err: 'lock lost' };
+			}
 			pr = API.patch_settings(X.token, cfg, loc.id, ids, mode == 'single' ? ids[0] : null);
 			patches++;
 			if (!pr.ok) break;
 			let nh = U.parse_vless(pr.data?.connection_url ?? '')?.host;
 			moved = pr.data?.server_id != old_server && nh != old_host;
-			// the config was recreated: from now on "current" is what PATCH returned
 			cfg = { ...cfg, connection_url: pr.data?.connection_url ?? cfg.connection_url, server_id: pr.data?.server_id ?? cfg.server_id };
 			if (moved) break;
 			U.log('warn', sprintf('PATCH kept server %s (%s) — retrying with explicit server_id', pr.data?.server_id, mode));
@@ -343,19 +421,21 @@ function rotate(opts) {
 		let new_url = pr.data?.connection_url, new_sid = pr.data?.server_id;
 		if (!new_url) { release(); return { ok: false, action: 'error', err: 'PATCH returned no connection_url' }; }
 		if (!moved) {
-			// still on the blocked server: keep its (new) link in storage so others stay in sync, try next location
+			// still on the blocked server: publish its recreated link so others stay in sync; next location
 			U.log('warn', sprintf('location %s: config stayed on server %s — next location', loc.code, new_sid));
-			write_rotation(binding, (n) => { n.rev = (n.rev ?? 0) + 1; n.url = new_url; n.server_id = new_sid; n.updated_at = ST.now(); }, 'rotation: same server, relinked');
+			let w = write_rotation(binding, (n) => { n.rev = (n.rev ?? 0) + 1; n.url = new_url; n.server_id = new_sid; n.updated_at = ST.now(); }, 'rotation: same server, relinked');
+			if (w.ok) st.applied_rev = w.obj.rev;
 			li++;
 			continue;
 		}
 		attempts++;
 		push(tried, new_sid);
 		cfg = { ...cfg, connection_url: new_url, server_id: new_sid, location_id: loc.id };
+		st.own_bl = { ...(st.own_bl ?? {}), ['' + old_server]: ST.now() + BLACKLIST_S };
 		// 8. write file
 		let hist = { at: ST.now(), by: X.rid, reason: opts.reason ?? 'blocked', from_server: old_server, to_server: new_sid,
 			location: loc.code, location_id: loc.id };
-		let w = write_rotation(binding, (n) => {
+		let w = opts.nolock ? { ok: false } : write_rotation(binding, (n) => {
 			n.rev = (n.rev ?? 0) + 1; n.url = new_url; n.server_id = new_sid; n.location_id = loc.id;
 			n.history = slice([...(n.history ?? []), hist], -ROT_HISTORY);
 			n.blacklist = { ...blacklisted(n, ST.now()), ['' + old_server]: ST.now() + BLACKLIST_S };
@@ -364,60 +444,73 @@ function rotate(opts) {
 			n.waiting = null;
 			n.updated_at = ST.now();
 		}, sprintf('rotation: %s -> server %d (%s)', binding, new_sid, loc.code));
-		if (!w.ok) { st.pending_writeback = { binding, url: new_url, server_id: new_sid, location_id: loc.id, hist }; save_state(); }
+		if (w.ok) st.applied_rev = w.obj.rev;
+		else st.pending_writeback = { binding, url: new_url, server_id: new_sid, location_id: loc.id, hist, old_server };
 		st.last_rotation = { at: ST.now(), to_server: new_sid, location: loc.code };
+		save_state();
 		// 9. apply + diagnostics
-		let ar = apply_link(new_url, 'own rotation');
+		let ar = apply_candidate(new_url);
 		if (ar.ok) {
 			release();
+			delete st.waiting_until;
 			alert('rotated-' + replace(binding, ':', '-'), sprintf('Блокировка и ротация: %s → %s, сервер %d → %d (%s)',
 				cfg.title ?? binding, loc.title ?? loc.code, hist.from_server, new_sid, C.router_name(X.contour, X.rid)));
 			return { ok: true, action: 'rotated', server_id: new_sid, location: loc.code, attempts, patches };
 		}
 		U.log('warn', sprintf('candidate server %d failed diagnostics (%s)', new_sid, ar.err ?? ''));
 		bl['' + new_sid] = ST.now() + BLACKLIST_S;
+		st.own_bl['' + new_sid] = ST.now() + BLACKLIST_S;
 		old_server = new_sid;
 		old_host = U.parse_vless(new_url)?.host;
 	}
 	if (opts.dry_run) return { ok: true, action: 'dry_run', plan, flags: API.patch_flags(cfg) };
-	// waiting mode (spec: 3 candidates failed)
+	// waiting mode (spec: candidates failed / none available): one router retries every retry_min through the lock
 	let retry = X.settings.retry_min * 60;
-	write_rotation(binding, (n) => {
-		n.waiting = { since: n.waiting?.since ?? ST.now(), next_try: ST.now() + retry, attempts: attempts };
+	st.waiting_until = ST.now() + retry;
+	if (!opts.nolock) write_rotation(binding, (n) => {
+		n.waiting = { since: n.waiting?.since ?? ST.now(), next_try: ST.now() + retry, attempts: (n.waiting?.attempts ?? 0) + attempts };
 		n.blacklist = { ...blacklisted(n, ST.now()) };
 		for (let s in tried) n.blacklist['' + s] = ST.now() + BLACKLIST_S;
 		if (n.lock?.by == X.rid) n.lock = null;
 	}, 'rotation: waiting mode');
 	st.status = 'waiting';
 	save_state();
-	alert('waiting-' + replace(binding, ':', '-'), sprintf('Ротация не помогает (%d кандидатов) — режим ожидания: техработы или массовая блокировка. Повтор каждые %d мин.', attempts, X.settings.retry_min));
+	alert('waiting-' + replace(binding, ':', '-'), sprintf('Ротация не помогает (кандидатов: %d) — режим ожидания: техработы или массовая блокировка. Повтор каждые %d мин.', attempts, X.settings.retry_min));
 	return { ok: false, action: 'waiting', attempts };
+}
+
+function rotate(opts) {
+	opts ??= {};
+	if (!engine_lock(opts.dry_run ? 30 : 150)) return { ok: false, action: 'busy', err: 'another Peers-SS process is working' };
+	let r;
+	try { r = rotate_inner(opts); }
+	catch (e) { U.log('error', 'rotate failed: ' + e); r = { ok: false, action: 'error', err: '' + e }; }
+	save_state();
+	engine_unlock();
+	return r;
 }
 
 // ---------- GitHub unavailable mode (spec §5) ----------
 function github_down_s() {
 	let since = ST.reachable_since();
-	let base = since > 0 ? since : st.started_mono;
-	return ST.mono() - base;
+	return ST.mono() - (since > 0 ? since : START_MONO);
 }
 
 function rotate_without_github() {
+	if (st.waiting_until && ST.now() < st.waiting_until) return { ok: false, action: 'waiting' };
+	if (st.last_rotation && ST.now() - st.last_rotation.at < X.settings.retry_min * 60) return { ok: false, action: 'too_soon' };
 	let b = bind_parts();
 	U.sleep_s(int(U.rand01() * 90));
 	let fc = find_config(X.token, b.config_id);
 	if (fc.err) return { ok: false, err: fc.err };
-	if (fc.cfg.connection_url != PK.current_link()) {
+	if (fc.cfg.connection_url != PK.current_link() && api_link_trusted(fc.cfg, null)) {
 		apply_link(fc.cfg.connection_url, 'API link (GitHub down)');
-		st.pending_writeback = { binding: X.binding, url: fc.cfg.connection_url, server_id: fc.cfg.server_id, location_id: fc.cfg.location_id };
+		st.pending_writeback ??= { binding: X.binding, url: fc.cfg.connection_url, server_id: fc.cfg.server_id, location_id: fc.cfg.location_id };
 		save_state();
 		return { ok: true, action: 'applied_api' };
 	}
-	let r = rotate({ reason: 'blocked (GitHub down)', nolock: true });
-	if (r.action == 'rotated') {
-		st.pending_writeback = { binding: X.binding, url: PK.current_link(), server_id: r.server_id };
-		save_state();
-	}
-	return r;
+	U.log('warn', 'GitHub unreachable for 3+ min — rotating without lock');
+	return rotate({ reason: 'blocked (GitHub down)', nolock: true });
 }
 
 // when GitHub is back: rotator appends a revision with the new link
@@ -426,34 +519,44 @@ function writeback() {
 	if (!p) return;
 	let w = write_rotation(p.binding, (n) => {
 		if (n.url != p.url) {
-			n.rev = (n.rev ?? 0) + 1; n.url = p.url; n.server_id = p.server_id; n.location_id = p.location_id;
+			n.rev = (n.rev ?? 0) + 1; n.url = p.url; n.server_id = p.server_id; n.location_id = p.location_id ?? n.location_id;
 			if (p.hist) n.history = slice([...(n.history ?? []), p.hist], -ROT_HISTORY);
+			if (p.old_server) n.blacklist = { ...blacklisted(n, ST.now()), ['' + p.old_server]: ST.now() + BLACKLIST_S };
 			n.updated_at = ST.now();
 		}
 		if (n.lock?.by == X.rid) n.lock = null;
 	}, 'rotation: writeback after GitHub outage');
-	if (w.ok) { U.log('info', 'writeback after GitHub outage done'); delete st.pending_writeback; save_state(); }
+	if (w.ok) { U.log('info', 'writeback after GitHub outage done'); st.applied_rev = w.obj.rev; delete st.pending_writeback; save_state(); }
 }
 
 // ---------- follower report / bad channel ----------
+let RECS = {}, RECS_MONO = 0;
+function recs_refresh(force) {
+	if (force || ST.mono() - RECS_MONO > 240) { RECS = read_routers(); RECS_MONO = ST.mono(); }
+	return RECS;
+}
+
+// one trigger per blocked episode; ignored (bad channel) if this router triggered twice in 30 min while others pass
 function record_trigger(binding) {
-	let now = ST.now(), mine = 0, ignore = false;
-	let recs = read_routers();
+	let now = ST.now(), ignore = false;
+	let recs = recs_refresh(true);
 	let others_ok = false;
 	for (let rid in C.binding_routers(X.contour, binding))
-		if (rid != X.rid && recs[rid] && recs[rid].status == 'ok' && now - (recs[rid].last_contact ?? 0) < 600) others_ok = true;
+		if (rid != X.rid && recs[rid]?.status == 'ok' && now - (recs[rid].last_contact ?? 0) < HEARTBEAT_S + 300) others_ok = true;
 	ST.update(rot_path(binding), (o) => {
 		o ??= { rev: 0, binding, history: [], blacklist: {}, reports: {}, triggers: {} };
 		let t = filter(o.triggers?.[X.rid] ?? [], (x) => now - x < BAD_WINDOW);
-		mine = length(t);
-		if (mine >= 2 && others_ok) { ignore = true; return null; }
+		if (length(t) >= 2 && others_ok) { ignore = true; return null; }
 		push(t, now);
 		return { ...o, triggers: { ...(o.triggers ?? {}), [X.rid]: t } };
 	}, { message: 'trigger ' + X.rid });
-	return { ignore, recs };
+	return { ignore };
 }
 
+// follower: report once per episode, refreshed every 150 s while still blocked
 function follower_report(binding) {
+	let now = ST.now();
+	if (st.episode?.report_at && now - st.episode.report_at < 150) return;
 	let r = rot_get(binding);
 	let snap = r.ok ? r.obj.loc_snapshot : null;
 	let pings = [];
@@ -461,34 +564,37 @@ function follower_report(binding) {
 		let ranked = P.rank_locations(snap);
 		pings = map(filter(ranked, (x) => x.ms != null), (x) => ({ id: x.loc.id, ms: x.ms }));
 	}
-	ST.update(rot_path(binding), (o) => {
+	let first_at = st.episode?.first_report_at ?? now;
+	let w = ST.update(rot_path(binding), (o) => {
 		o ??= { rev: 0, binding, history: [], blacklist: {}, reports: {}, triggers: {} };
-		return { ...o, reports: { ...(o.reports ?? {}), [X.rid]: { at: ST.now(), pings } } };
+		return { ...o, reports: { ...(o.reports ?? {}), [X.rid]: { at: ST.now(), first_at, pings } } };
 	}, { message: 'blocked report ' + X.rid });
+	if (w.ok) { st.episode.report_at = now; st.episode.first_report_at = first_at; }
 	U.log('info', 'follower: blocked report written, waiting for a token router');
 }
 
-// token router: take over a follower's fresh report
+// token router: take over a follower's fresh report (first token router at once, any other after 100 s)
 function handle_reports(recs) {
 	let r = rot_get();
 	if (!r.ok || !r.obj.reports) return;
 	let now = ST.now(), last = r.obj.history?.[-1]?.at ?? 0;
+	if (r.obj.waiting && now < r.obj.waiting.next_try) return;
 	for (let rid, rep in r.obj.reports) {
 		if (rid == X.rid || now - rep.at > 180 || rep.at < last) continue;
-		if (first_token_router(X.binding, recs) != X.rid) return;
-		U.log('info', 'blocked report from ' + C.router_name(X.contour, rid) + ' — rotating for it');
-		let r = rotate({ reason: 'blocked on ' + C.router_name(X.contour, rid), ext_pings: rep.pings, for_report: true });
-		U.log('info', 'rotation for report: ' + r.action + (r.err ? ' — ' + r.err : ''));
+		let first = first_token_router(X.binding, recs) == X.rid;
+		if (!first && now - (rep.first_at ?? rep.at) < 100) continue;
+		U.log('info', 'blocked report from ' + C.router_name(X.contour, rid) + ' — rotating for it' + (first ? '' : ' (first token router did not react)'));
+		let rr = rotate({ reason: 'blocked on ' + C.router_name(X.contour, rid), ext_pings: rep.pings, for_report: true });
+		U.log('info', 'rotation for report: ' + rr.action + (rr.err ? ' — ' + rr.err : ''));
 		return;
 	}
-	// no token router at all for this binding -> alert (any router)
 }
 
 // ---------- reconcile + cards (token router) ----------
 function write_card(cfg, exists) {
 	if (!X.bot_key) return;
 	let lc = X.contour?.name;
-	let card = { binding: X.binding, cid: X.cid, contour: lc, exists, title: cfg?.title, expires_at: cfg?.expires_at,
+	let card = { binding: X.binding, cid: X.cid, contour: lc, exists, title: cfg?.title ?? null, expires_at: cfg?.expires_at,
 		auto_renewal: cfg?.auto_renewal, location_id: cfg?.location_id, updated_at: ST.now() };
 	ST.update(C.p_card(X.cid, X.binding), () => card, { key: X.bot_key, message: 'card ' + X.binding });
 }
@@ -505,6 +611,7 @@ function reconcile(recs, every_s) {
 	if (fc.err) {
 		if (fc.err == 'token_invalid') alert('token-invalid-' + X.rid, 'Токен StealthSurf недействителен на ' + C.router_name(X.contour, X.rid));
 		else if (fc.err == 'config_missing') {
+			if (now - (st.cards_at ?? 0) >= 6 * 3600) { write_card(null, false); st.cards_at = now; }
 			alert('config-missing-' + replace(X.binding, ':', '-'), 'Конфиг ' + X.binding + ' исчез из аккаунта');
 			if (!length(API.vless_configs(fc.list))) alert('account-empty-' + b.account, 'Аккаунт ' + b.account + ' пуст: нет vless-конфигов');
 		}
@@ -512,14 +619,14 @@ function reconcile(recs, every_s) {
 	}
 	let r = rot_get();
 	let file_url = r.ok ? r.obj.url : null;
-	if (fc.cfg.connection_url != file_url) {
-		U.log('info', 'reconcile: API link differs from storage — writing it');
-		write_rotation(X.binding, (n) => {
+	if (fc.cfg.connection_url != file_url && r.ok && !r.obj.lock && api_link_trusted(fc.cfg, r.obj)) {
+		U.log('info', 'reconcile: API link differs from storage (changed in console) — writing it');
+		let w = write_rotation(X.binding, (n) => {
 			n.rev = (n.rev ?? 0) + 1; n.url = fc.cfg.connection_url; n.server_id = fc.cfg.server_id;
 			n.location_id = fc.cfg.location_id; n.updated_at = ST.now();
 		}, 'rotation: reconcile with API');
+		if (w.ok) { apply_link(fc.cfg.connection_url, 'reconcile'); st.applied_rev = w.obj.rev; }
 	}
-	if (fc.cfg.connection_url != PK.current_link()) apply_link(fc.cfg.connection_url, 'reconcile');
 	// cards + location snapshot every 6 h
 	if (now - (st.cards_at ?? 0) >= 6 * 3600) {
 		write_card(fc.cfg, true);
@@ -574,31 +681,31 @@ function ctx() { return X; }
 function state() { return st; }
 
 // ---------- one service iteration ----------
-function tick() {
+function tick_inner() {
 	let now_m = ST.mono();
-	st.started_mono ??= now_m;
 	U.cleanup_tmp();
 	let gh_ok = refresh_contour();
-	if (!X.binding) { st.status = 'no_binding'; save_state(); if (gh_ok) heartbeat(); return; }
-	if (st.status == 'update_required') { save_state(); return; }
+	if (!X.binding) { st.status = 'no_binding'; if (gh_ok) heartbeat(); return; }
+	if (st.status == 'update_required') return;
 
-	// podkop changed after update?
+	// podkop changed after update? (spec §7)
 	let pc = PK.check_podkop();
 	st.podkop = pc;
 	if (!pc.ok && PK.current_link() != null) {
 		st.status = 'podkop_changed';
 		alert('podkop-changed-' + X.rid, 'podkop изменился на ' + C.router_name(X.contour, X.rid) + ': ' + pc.reason + ' — нужна перенастройка');
-		save_state(); heartbeat(); return;
+		heartbeat(); return;
 	}
 
 	if (gh_ok) { writeback(); deliver(); }
 
-	// health
+	// health (4 layers)
 	let link = PK.current_link();
 	let h = link ? H.check(link) : { verdict: 'no_link' };
 	st.layers = h;
 	st.last_check = ST.now();
-	if (h.verdict == 'no_internet') { st.status = 'no_internet'; }
+	let waiting = (st.rot?.waiting && ST.now() < st.rot.waiting.next_try + 600) || (st.waiting_until && ST.now() < st.waiting_until + 600);
+	if (h.verdict == 'no_internet') st.status = 'no_internet';
 	else if (h.verdict == 'podkop_down') {
 		st.status = 'podkop_down';
 		U.log('warn', 'podkop/sing-box down — restarting podkop');
@@ -606,62 +713,71 @@ function tick() {
 	}
 	else if (h.verdict == 'ok') {
 		st.counter = 0;
-		if (st.status != 'waiting' || !st.rot?.waiting) st.status = 'ok';
+		delete st.episode;
+		st.status = 'ok';
 		if (now_m - (st.lat_mono ?? 0) > 1800) { let l = PK.latency(); if (l.ms) { st.ping_ms = l.ms; st.ping_at = ST.now(); } st.lat_mono = now_m; }
 	}
 	else if (h.verdict == 'fail') {
 		st.counter = (st.counter ?? 0) + 1;
-		st.status = 'failing';
+		st.status = waiting ? 'waiting' : 'failing';
 		U.log('warn', sprintf('check failed (l3=%s l4=%s), counter %d/%d', h.l3, h.l4, st.counter, X.settings.fail_threshold));
 	}
 	save_state();
 
+	let blocked = st.counter >= X.settings.fail_threshold;
 	let ignore = st.ignore_until && ST.now() < st.ignore_until;
-	if (st.counter >= X.settings.fail_threshold && !ignore) {
-		st.status = 'blocked';
-		save_state();
-		if (!gh_ok && github_down_s() >= 180) {
-			if (my_token_fits(X.binding)) rotate_without_github();
-		} else if (gh_ok) {
-			let t = record_trigger(X.binding);
-			if (t.ignore) {
+	if (blocked && !ignore) {
+		if (!st.episode) {
+			// new blocked episode: one trigger (bad-channel bookkeeping)
+			st.episode = { at: ST.now() };
+			if (gh_ok && record_trigger(X.binding).ignore) {
 				st.ignore_until = ST.now() + BAD_IGNORE;
 				st.status = 'bad_channel';
 				alert('badchannel-' + X.rid, 'Плохой канал на ' + C.router_name(X.contour, X.rid) + ': сигналы блокировки игнорируются 1 час');
-			} else if (my_token_fits(X.binding)) {
-				let r = rotate({ reason: 'blocked' });
-				U.log('info', 'rotation result: ' + r.action + (r.err ? ' — ' + r.err : ''));
+				save_state(); heartbeat(); return;
+			}
+		}
+		st.status = waiting ? 'waiting' : 'blocked';
+		save_state();
+		if (!gh_ok && github_down_s() >= 180) {
+			if (my_token_fits(X.binding)) {
+				let r = rotate_without_github();
+				U.log('info', 'rotation without GitHub: ' + (r.action ?? '-') + (r.err ? ' — ' + r.err : ''));
+			}
+		} else if (gh_ok) {
+			if (my_token_fits(X.binding)) {
+				let retry = st.rot?.waiting && ST.now() >= st.rot.waiting.next_try;
+				let r = rotate({ reason: retry ? 'retry (waiting)' : 'blocked', retry });
+				if (r.action != 'too_soon' && r.action != 'waiting') U.log('info', 'rotation result: ' + r.action + (r.err ? ' — ' + r.err : ''));
+				if (retry) { let q = rot_get(); if (q.ok) st.rot = { rev: q.obj.rev, waiting: q.obj.waiting }; }
 			} else follower_report(X.binding);
 		}
 		save_state();
 	}
 
-	// waiting mode: retry every retry_min through the lock
-	if (gh_ok && st.rot?.waiting && my_token_fits(X.binding) && ST.now() >= st.rot.waiting.next_try && st.counter >= X.settings.fail_threshold) {
-		let r = rotate({ reason: 'retry (waiting)', retry: true });
-		U.log('info', 'waiting-mode retry: ' + r.action);
-	}
-
-	// GitHub down: token routers compare with API every 2 min
+	// GitHub down: token routers compare with API every 2 min (never adopting a possibly cached/blocked link)
 	if (!gh_ok && github_down_s() >= 60 && my_token_fits(X.binding) && ST.now() - (st.gh_down_check ?? 0) >= 120) {
 		st.gh_down_check = ST.now();
 		let fc = find_config(X.token, bind_parts().config_id);
-		if (!fc.err && fc.cfg.connection_url != PK.current_link()) {
+		if (!fc.err && fc.cfg.connection_url != PK.current_link() && api_link_trusted(fc.cfg, null)) {
 			apply_link(fc.cfg.connection_url, 'API link while GitHub is down');
-			st.pending_writeback = { binding: X.binding, url: fc.cfg.connection_url, server_id: fc.cfg.server_id, location_id: fc.cfg.location_id };
+			st.pending_writeback ??= { binding: X.binding, url: fc.cfg.connection_url, server_id: fc.cfg.server_id, location_id: fc.cfg.location_id };
 		}
 	}
 
 	if (gh_ok) {
-		let recs = null;
-		if (now_m - (st.routers_mono ?? 0) > 240 || st.status != 'ok') { recs = read_routers(); st.routers_mono = now_m; st.recs = recs; }
-		recs ??= st.recs ?? {};
+		let recs = recs_refresh(st.status != 'ok');
 		if (my_token_fits(X.binding)) { handle_reports(recs); reconcile(recs, 600); }
 		heartbeat();
-		if (now_m - (st.watch_mono ?? 0) > 600) { watchdog(recs); write_summary(recs); st.watch_mono = now_m; }
+		if (now_m - (st.watch_mono ?? 0) > 600 && length(keys(recs))) { watchdog(recs); write_summary(recs); st.watch_mono = now_m; }
 	}
-	delete st.recs;
+}
+
+function tick() {
+	if (!engine_lock(60)) { U.log('info', 'tick skipped: another Peers-SS process is working'); return; }
+	try { tick_inner(); } catch (e) { U.log('error', 'tick failed: ' + e + '\n' + (e.stacktrace?.[0]?.context ?? '')); }
 	save_state();
+	engine_unlock();
 }
 
 export { VERSION, init, tick, rotate, refresh_contour, deliver, heartbeat, read_routers, alert, write_rotation, router_record,

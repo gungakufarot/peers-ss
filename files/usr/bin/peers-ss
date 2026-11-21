@@ -314,11 +314,12 @@ function cmd_daemon() {
 	U.set_log_echo(false);
 	let interval = 45;
 	while (true) {
+		let t0 = time();
 		if (E.init()) {
 			try { E.tick(); } catch (e) { U.log('error', 'tick failed: ' + e); }
 			interval = E.ctx()?.settings?.check_interval_s ?? 45;
 		} else U.log('warn', 'not configured, sleeping');
-		U.sleep_s(interval);
+		U.sleep_s(max(5, interval - (time() - t0)));
 	}
 }
 

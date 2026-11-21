@@ -50,7 +50,8 @@ function url(path) {
 function cache_file(path) { return CACHE + '/' + substr(sha256_hex(ctx.repo + '/' + path), 0, 24) + '.json'; }
 
 function track(res) {
-	if (res.status >= 200 && res.status < 500 && res.status != 0) {
+	// 401/403/429 (revoked token, rate limit) count as "GitHub unavailable" for the rotation logic
+	if (res.status >= 200 && res.status < 500 && index([401, 403, 429], res.status) < 0) {
 		last_ok = mono(); last_err = null; note_date(res);
 	} else last_err = res.err ?? ('HTTP ' + res.status);
 	return res;
