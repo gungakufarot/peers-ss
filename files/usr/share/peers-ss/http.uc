@@ -13,7 +13,7 @@ function request(url, opts) {
 	let cfg = base + '.cfg', hdr = base + '.hdr', out = base + '.out', inp = base + '.in';
 	let lines = [];
 	for (let k, v in opts.headers ?? {})
-		push(lines, sprintf('header = "%s: %s"', k, replace('' + v, /["\\\n]/g, '')));
+		push(lines, sprintf('header = "%s: %s"', k, replace(replace('' + v, /[\r\n]/g, ''), /["\\]/g, (c) => '\\' + c)));
 	fs.writefile(cfg, join('\n', lines) + '\n');
 	fs.chmod(cfg, 0600);
 	let cmd = sprintf('curl -sS -K %s -X %s -D %s -o %s -w %%{http_code} --max-time %d --connect-timeout %d',

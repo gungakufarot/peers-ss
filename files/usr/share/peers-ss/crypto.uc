@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import { sha256 } from 'digest';
 import { RUN, q, mkdirp, sh, rand_hex, uniq_name } from './util.uc';
 
-const KDF_ITER = 20000;
+const KDF_ITER = 100000;   // ~2 s on aarch64 router; computed once when the password is entered
 
 function sha256_bin(s) { return hexdec(sha256(s)); }
 function sha256_hex(s) { return sha256(s); }
@@ -33,6 +33,12 @@ function kdf(password, salt_hex, iter) {
 		h = sha256_bin(h + password + salt);
 	return hexenc(h);
 }
+
+// contour salt: derived from the random contour_id (the only plaintext identifier of the contour folder)
+function contour_salt(contour_id) { return sha256('peers-ss/salt\x00' + contour_id); }
+
+// contour master key from the contour password
+function contour_key(password, contour_id) { return kdf(password, contour_salt(contour_id)); }
 
 function subkeys(master_hex) {
 	let m = hexdec(master_hex);
@@ -103,4 +109,4 @@ function device_key(router_id) {
 	return kdf(macs + '|' + board, hexenc('peers-ss-device|' + (router_id ?? '')), 2000);
 }
 
-export { kdf, encrypt, decrypt, encrypt_json, decrypt_json, hmac_sha256, fp, device_key, sha256_hex };
+export { kdf, contour_salt, contour_key, encrypt, decrypt, encrypt_json, decrypt_json, hmac_sha256, fp, device_key, sha256_hex };
