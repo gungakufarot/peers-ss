@@ -2,16 +2,14 @@
 'use strict';
 
 import * as fs from 'fs';
-import { RUN, q, mkdirp, sh } from './util.uc';
-
-let seq = 0;
+import { RUN, q, mkdirp, sh, uniq_name } from './util.uc';
 
 // opts: { method, headers: {k:v}, body (string), timeout (s), proxy (socks5h://...), connect_timeout }
 // returns { status, headers: {lowercased: value}, body, err }
 function request(url, opts) {
 	opts ??= {};
 	mkdirp(RUN + '/http');
-	let base = sprintf('%s/http/%d-%d', RUN, time(), ++seq);
+	let base = RUN + '/http/' + uniq_name();
 	let cfg = base + '.cfg', hdr = base + '.hdr', out = base + '.out', inp = base + '.in';
 	let lines = [];
 	for (let k, v in opts.headers ?? {})
@@ -46,16 +44,16 @@ function json_body(res) {
 }
 
 // RFC 1123 date -> unix seconds (GitHub "Date" header)
-const MON = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+const MON = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
 function parse_http_date(s) {
 	let m = match(s ?? '', /(\d+) (\w{3}) (\d{4}) (\d\d):(\d\d):(\d\d)/);
 	if (!m) return null;
 	let y = +m[3], mo = MON[m[2]], d = +m[1];
 	// days from civil (Howard Hinnant)
-	let yy = mo < 2 ? y - 1 : y;
+	let yy = mo <= 2 ? y - 1 : y;
 	let era = int(yy / 400);
 	let yoe = yy - era * 400;
-	let mp = (mo + 9) % 12;
+	let mp = (mo + 9) % 12; // March = 0
 	let doy = int((153 * mp + 2) / 5) + d - 1;
 	let doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy;
 	let days = era * 146097 + doe - 719468;

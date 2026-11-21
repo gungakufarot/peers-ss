@@ -21,7 +21,7 @@ function call(token, method, path, body) {
 			code: j.errorCode, message: j.message, retry_after: +(r.headers['retry-after'] ?? 0), err: r.err };
 		if (r.status == 429 && attempt < 2) {
 			let w = res.retry_after > 0 ? res.retry_after : 2;
-			if (w > 60) return res;
+			if (w > 60) { log('warn', sprintf('StealthSurf 429 on %s, Retry-After %ds — giving up', path, w)); return res; }
 			log('warn', sprintf('StealthSurf 429 on %s, waiting %ds', path, w));
 			sleep_s(w);
 			continue;

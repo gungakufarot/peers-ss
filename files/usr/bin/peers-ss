@@ -11,6 +11,7 @@ import * as P from '/usr/share/peers-ss/ping.uc';
 
 const VERSION = '0.1.0';
 U.set_log_echo(false);
+U.cleanup_tmp();
 
 function out(s) { print(s, '\n'); }
 function fail(s) { warn('peers-ss: ', s, '\n'); exit(1); }
@@ -47,7 +48,8 @@ function token_check(token) {
 	let p = API.profile(token);
 	if (!p.ok) return { ok: false, status: p.status, message: p.message };
 	let c = API.configs(token);
-	let v = API.vless_configs(c.ok ? c.data : []);
+	if (!c.ok) return { ok: false, status: c.status, message: 'GET /configs failed: ' + (c.message ?? c.err ?? '') };
+	let v = API.vless_configs(c.data);
 	let soonest = null;
 	for (let x in v) if (soonest == null || x.expires_at < soonest) soonest = x.expires_at;
 	return { ok: true, account: p.data.id, email: p.data.email, vless: length(v), soonest };
@@ -56,11 +58,13 @@ function token_check(token) {
 function cmd_token(args) {
 	let sub = args[0] ?? 'show';
 	if (sub == 'set') {
-		let t = args[1] ?? ask('StealthSurf token (stlth_…, shown as typed): ');
+		// token only via stdin (never argv: visible in ps/history); spec §4: input is shown as typed
+		if (args[1]) fail('pass the token via stdin/prompt, not as an argument');
+		let t = ask('StealthSurf token (stlth_…, shown as typed): ');
 		if (!t || !match(t, /^stlth_[a-f0-9]{8}_[a-f0-9]{24}$/)) fail('token format: stlth_<8 hex>_<24 hex>');
 		let r = token_check(t);
 		if (!r.ok) fail(sprintf('token rejected by API (HTTP %d %s)', r.status, r.message ?? ''));
-		let label = args[2] ?? ask('Label (e.g. «Аккаунт Иванова»), empty = account id: ');
+		let label = ask('Label (e.g. «Аккаунт Иванова»), empty = account id: ');
 		let old = S.get('ss_account');
 		let sec = { ...S.load(), ss_token: t, ss_account: r.account, ss_label: label || ('#' + r.account) };
 		S.save(sec);
@@ -113,6 +117,7 @@ function cmd_config(args) {
 		let v = list_vless(need_token());
 		if (!length(v)) fail('account is empty');
 		let n = args[1] ?? ask(sprintf('Config number 1-%d: ', length(v)));
+		if (!match(n ?? '', /^[0-9]+$/)) fail('wrong number');
 		n = +n;
 		if (!(n >= 1 && n <= length(v))) fail('wrong number');
 		let c = v[n - 1];

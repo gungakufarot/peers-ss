@@ -35,8 +35,19 @@ function readjson(path) {
 }
 
 // atomic write (tmp + rename); mode 0600 for anything under /etc/peers-ss
+function uniq_name() { return sprintf('%d-%s', time(), hexenc(fs.readfile('/dev/urandom', 6))); }
+
+// remove stale temp files (e.g. curl configs with tokens left by a killed process)
+function cleanup_tmp() {
+	for (let d in [RUN + '/http', RUN + '/c'])
+		for (let f in fs.glob(d + '/*') ?? []) {
+			let st = fs.stat(f);
+			if (st && time() - st.mtime > 300) fs.unlink(f);
+		}
+}
+
 function writefile(path, data, mode) {
-	let tmp = path + '.tmp' + time();
+	let tmp = path + '.tmp' + uniq_name();
 	if (!fs.writefile(tmp, data)) return false;
 	fs.chmod(tmp, mode ?? 0600);
 	return fs.rename(tmp, path);
@@ -110,4 +121,4 @@ function median(arr) {
 	return n % 2 ? a[n >> 1] : (a[n / 2 - 1] + a[n / 2]) / 2;
 }
 
-export { RUN, ETC, q, mkdirp, sh, readjson, writefile, writejson, writejson_if_changed, redact, log, set_log_echo, sleep_s, rand_hex, parse_vless, median };
+export { RUN, ETC, uniq_name, cleanup_tmp, q, mkdirp, sh, readjson, writefile, writejson, writejson_if_changed, redact, log, set_log_echo, sleep_s, rand_hex, parse_vless, median };

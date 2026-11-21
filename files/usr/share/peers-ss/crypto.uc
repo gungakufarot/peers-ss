@@ -5,7 +5,7 @@
 
 import * as fs from 'fs';
 import { sha256 } from 'digest';
-import { RUN, q, mkdirp, sh, rand_hex } from './util.uc';
+import { RUN, q, mkdirp, sh, rand_hex, uniq_name } from './util.uc';
 
 const KDF_ITER = 20000;
 
@@ -46,10 +46,9 @@ function ct_equal(a, b) {
 	return d == 0;
 }
 
-let n = 0;
 function tmpbase() {
 	mkdirp(RUN + '/c');
-	return sprintf('%s/c/%d-%d', RUN, time(), ++n);
+	return RUN + '/c/' + uniq_name();
 }
 
 function uenc(mode, key_hex, iv_hex, data) {

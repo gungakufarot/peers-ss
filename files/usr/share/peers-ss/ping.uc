@@ -3,11 +3,11 @@
 'use strict';
 
 import * as fs from 'fs';
-import { RUN, q, mkdirp, sh } from './util.uc';
+import { RUN, q, mkdirp, sh, uniq_name } from './util.uc';
 
 // targets: [{ host, port }] ; returns { "host:port": { ms, method } } (ms = null -> unreachable)
 function probe(targets) {
-	let dir = sprintf('%s/ping-%d', RUN, time());
+	let dir = RUN + '/ping-' + uniq_name();
 	mkdirp(dir);
 	let uniq = {}, script = 'cd ' + q(dir) + '\n', i = 0, keys = [];
 	for (let t in targets) {
@@ -17,7 +17,7 @@ function probe(targets) {
 		push(keys, key);
 		let tcp = t.port
 			? sprintf('t=$(curl -sk -o /dev/null -m 2 --connect-timeout 2 -w "%%{time_connect}" %s); ' +
-			          'case "$t" in ""|0|0.0*0) ;; *) echo "tcp $t" > %d; exit;; esac; ',
+			          'case "$t" in ""|0|0.000000) ;; *) echo "tcp $t" > %d; exit;; esac; ',
 			          q('https://' + (index(t.host, ':') >= 0 ? '[' + t.host + ']' : t.host) + ':' + t.port + '/'), i)
 			: '';
 		script += sprintf('( r=$(ping -c 2 -W 1 %s 2>/dev/null | sed -n "s#.*min/avg/max = [0-9.]*/\\([0-9.]*\\)/.*#\\1#p"); ' +
@@ -33,7 +33,7 @@ function probe(targets) {
 		let ms = null;
 		if (l[0] == 'icmp') ms = +l[1];
 		else if (l[0] == 'tcp') ms = +l[1] * 1000;
-		res[keys[n]] = { ms: ms != null ? int(ms * 10) / 10 : null, method: l[0] };
+		res[keys[n]] = { ms: ms != null ? int(ms * 10) / 10.0 : null, method: l[0] };
 		fs.unlink(dir + '/' + n);
 	}
 	fs.unlink(dir + '/run.sh');
