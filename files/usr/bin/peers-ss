@@ -14,6 +14,7 @@ import * as E from '/usr/share/peers-ss/engine.uc';
 import * as SU from '/usr/share/peers-ss/setup.uc';
 import * as ST from '/usr/share/peers-ss/store.uc';
 import * as C from '/usr/share/peers-ss/contour.uc';
+import { request } from '/usr/share/peers-ss/http.uc';
 
 const VERSION = E.VERSION;
 U.set_log_echo(false);
@@ -118,23 +119,6 @@ function cmd_configs() {
 		out(sprintf('%2d) %-32s id=%-7d loc=%-3d until %s%s', n++, c.title ?? '-', c.id, c.location_id, fmt_date(c.expires_at), c.auto_renewal ? ' (auto-renew)' : ''));
 }
 
-function cmd_config(args) {
-	if (args[0] == 'select') {
-		let v = list_vless(need_token());
-		if (!length(v)) fail('account is empty');
-		let n = args[1] ?? ask(sprintf('Config number 1-%d: ', length(v)));
-		if (!match(n ?? '', /^[0-9]+$/)) fail('wrong number');
-		n = +n;
-		if (!(n >= 1 && n <= length(v))) fail('wrong number');
-		let c = v[n - 1];
-		let bind = sprintf('%d:%d', S.get('ss_account'), c.id);
-		uci_set('selected_config', bind);
-		out(sprintf('Selected: %s (%s)', c.title ?? '-', bind));
-		return;
-	}
-	if (args[0] == 'show' || !args[0]) return out(uci_get('selected_config', '-'));
-	fail('usage: peers-ss config select [N] | show');
-}
 
 // ---- locations ----
 function cmd_locations() {
@@ -323,9 +307,181 @@ function cmd_daemon() {
 	}
 }
 
+// ---- config assign (token router): bind a vless config to this router's environment ----
+function assign_config(x, cfg) {
+	let bind = sprintf('%d:%d', S.get('ss_account'), cfg.id);
+	let eo = C.env_of(x.contour, x.rid);
+	if (!eo) fail('router is not in any environment');
+	let w = ST.update(C.p_contour(x.cid), (c) => {
+		let n = { ...c, rev: c.rev + 1 };
+		let e = eo.group_id ? n.groups[eo.group_id].envs[eo.env_id] : n.standalone[eo.env_id];
+		if (!e) return null;
+		if (e.config && e.config != bind) n.archive = [...(n.archive ?? []), { at: ST.now(), group: eo.group_id, env: eo.env_id, config: e.config }];
+		e.config = bind;
+		return n;
+	}, { message: 'contour: assign config ' + bind });
+	if (!w.ok) fail('cannot save contour: ' + (w.err ?? ''));
+	// rotations/<binding>.json always holds the current link (spec §4 B.6)
+	let r = ST.get(C.p_rotation(x.cid, bind));
+	if (!r.ok && r.missing)
+		ST.put(C.p_rotation(x.cid, bind), { rev: 1, binding: bind, url: cfg.connection_url, server_id: cfg.server_id,
+			location_id: cfg.location_id, history: [], blacklist: {}, reports: {}, triggers: {}, lock: null, updated_at: ST.now() }, null, 'rotation ' + bind + ': initial link');
+	return bind;
+}
+
+function choose_config(token) {
+	let v = list_vless(token);
+	if (!length(v)) { out('WARNING: account is empty — no vless configs'); return null; }
+	let n = 1;
+	for (let c in v) out(sprintf('  %2d) %-32s until %s', n++, c.title ?? '-', fmt_date(c.expires_at)));
+	while (true) {
+		let a = ask(sprintf('Config number 1-%d: ', length(v)));
+		if (match(a ?? '', /^[0-9]+$/) && +a >= 1 && +a <= length(v)) return v[+a - 1];
+		if (a == null) fail('aborted');
+		out('wrong number');
+	}
+}
+
+function cmd_config_assign() {
+	let x = need_engine();
+	let c = choose_config(need_token());
+	if (!c) return;
+	let bind = assign_config(x, c);
+	out('Assigned ' + (c.title ?? '-') + ' (' + bind + ') to the environment of this router; applying…');
+	E.refresh_contour();
+	let r = ST.get(C.p_rotation(x.cid, bind));
+	if (r.ok) print_apply(PK.apply_link(r.obj.url, { setup: true }));
+}
+
+// ---- join wizard (spec §4, mode B) — implemented in stage 8 ----
+function cmd_join_wizard(code) { fail('joining by invite is not available in this version'); }
+
+// ---- installer wizard (spec §4, mode A) ----
+function ask_nonempty(prompt, re, errmsg) {
+	while (true) {
+		let a = ask(prompt);
+		if (a == null) fail('aborted');
+		if (match(a, re)) return a;
+		out(errmsg);
+	}
+}
+
+function choose_podkop_section() {
+	let secs = PK.proxy_sections();
+	if (!length(secs)) {
+		out('No podkop sections with connection_type proxy — creating section «peers_ss».');
+		out('Domain/subnet lists for it are set in LuCI → Services → podkop.');
+		return 'peers_ss';
+	}
+	out('podkop proxy sections (Peers-SS will replace their proxy link):');
+	let n = 1;
+	for (let s in secs) out(sprintf('  %d) %s', n++, s));
+	out(sprintf('  %d) create new section «peers_ss»', n));
+	while (true) {
+		let a = ask(sprintf('Section number 1-%d: ', n));
+		if (match(a ?? '', /^[0-9]+$/) && +a >= 1 && +a <= n) return +a == n ? 'peers_ss' : secs[+a - 1];
+		if (a == null) fail('aborted');
+	}
+}
+
+// spec §6: router's own requests must bypass the tunnel
+function ensure_direct_api() {
+	let c = cursor();
+	if (c.get('podkop', 'settings', 'enable_output_network_interface') != '1') return;
+	out('podkop routes router traffic (enable_output_network_interface=1): adding api.stealthsurf.net and api.github.com to podkop exclusions');
+	if (c.get('podkop', 'peers_ss_direct') == null) {
+		c.set('podkop', 'peers_ss_direct', 'section');
+		c.set('podkop', 'peers_ss_direct', 'connection_type', 'exclusion');
+		c.set('podkop', 'peers_ss_direct', 'user_domain_list_type', 'dynamic');
+		c.set('podkop', 'peers_ss_direct', 'user_domains', ['api.stealthsurf.net', 'api.github.com', 'raw.githubusercontent.com']);
+		c.commit('podkop');
+	}
+}
+
+function wizard_finish(link) {
+	ensure_direct_api();
+	if (link) {
+		out('Applying the link to podkop and running diagnostics (up to 60 s)…');
+		let r = PK.apply_link(link, { setup: true });
+		print_apply(r);
+		if (!r.ok) out('WARNING: diagnostics did not pass — check LuCI → podkop → Diagnostics');
+	} else out('No config assigned yet: this router works as a follower until a config is assigned (LuCI or `peers-ss config assign`).');
+	system('/etc/init.d/peers-ss enable; /etc/init.d/peers-ss restart >/dev/null 2>&1');
+	out('Peers-SS service started. LuCI: Services → Peers-SS.');
+}
+
+function cmd_wizard() {
+	let join = getenv('PEERS_SS_JOIN');
+	if (join) return cmd_join_wizard(join);
+	if (uci_get('contour_id')) {
+		out(sprintf('This router is already in contour %s (%s). Settings kept; service restarted.', uci_get('contour_id'), uci_get('router_id')));
+		system('/etc/init.d/peers-ss enable; /etc/init.d/peers-ss restart >/dev/null 2>&1');
+		return;
+	}
+	out('== Peers-SS: new contour (first router) ==');
+	let name = ask_nonempty('Contour name (e.g. client surname, 1-32 chars): ', /^.{1,32}$/, 'name: 1-32 characters');
+	let pw;
+	while (true) {
+		pw = ask_nonempty('Contour password (min 8 chars, shown as typed): ', /^.{8,}$/, 'at least 8 characters');
+		if (ask('Repeat password: ') == pw) break;
+		out('passwords differ, again');
+	}
+	let repo = ask_nonempty('State repository (owner/peers-ss-state): ', /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'format: owner/name');
+	let gh;
+	while (true) {
+		gh = ask_nonempty('GitHub fine-grained token (Contents: Read and write on this repo only; shown as typed): ', /^(github_pat_|ghp_)[A-Za-z0-9_]+$/, 'unexpected token format');
+		let rq = request(sprintf('https://api.github.com/repos/%s', repo), { headers: { Authorization: 'Bearer ' + gh, 'User-Agent': 'peers-ss', Accept: 'application/vnd.github+json' } });
+		if (rq.status == 200) break;
+		out(sprintf('GitHub: no access to %s with this token (HTTP %d)', repo, rq.status));
+	}
+	S.set('gh_token', gh);
+	let cfg = null, bind = null;
+	let t = ask('StealthSurf token stlth_… (Enter = add later): ');
+	if (t) {
+		if (!match(t, /^stlth_[a-f0-9]{8}_[a-f0-9]{24}$/)) fail('token format: stlth_<8 hex>_<24 hex>');
+		let r = token_check(t);
+		if (!r.ok) fail(sprintf('token rejected (HTTP %d %s)', r.status, r.message ?? ''));
+		out(sprintf('Account %d%s, vless configs: %d', r.account, r.email ? ' (' + r.email + ')' : '', r.vless));
+		let label = ask('Token label (e.g. «Аккаунт Иванова»): ');
+		S.save({ ...S.load(), ss_token: t, ss_account: r.account, ss_label: label || ('#' + r.account) });
+		cfg = choose_config(t);
+		if (cfg) bind = sprintf('%d:%d', r.account, cfg.id);
+	}
+	let sec = choose_podkop_section();
+	uci_set('podkop_section', sec);
+	let bk = ask('Bot key (64 hex, Enter = set later in LuCI → Notifications): ');
+	let res = SU.create_contour(name, pw, repo, bind, cfg);
+	if (!res.ok) fail(res.err);
+	out(sprintf('Contour %s created: group «peers-ss», environment «среда-1», this router = openwrt-1', res.cid));
+	if (match(bk ?? '', /^[0-9a-f]{64}$/)) {
+		ST.update(C.p_contour(res.cid), (c) => ({ ...c, rev: c.rev + 1, settings: { ...c.settings, bot_key: bk } }), { message: 'contour: bot key' });
+		out('Bot key saved');
+	}
+	wizard_finish(cfg?.connection_url);
+}
+
+function cmd_config(args) {
+	if (args[0] == 'select') {
+		let v = list_vless(need_token());
+		if (!length(v)) fail('account is empty');
+		let n = args[1] ?? ask(sprintf('Config number 1-%d: ', length(v)));
+		if (!match(n ?? '', /^[0-9]+$/)) fail('wrong number');
+		n = +n;
+		if (!(n >= 1 && n <= length(v))) fail('wrong number');
+		let c = v[n - 1];
+		let bind = sprintf('%d:%d', S.get('ss_account'), c.id);
+		uci_set('selected_config', bind);
+		out(sprintf('Selected: %s (%s)', c.title ?? '-', bind));
+		return;
+	}
+	if (args[0] == 'assign') return cmd_config_assign();
+	if (args[0] == 'show' || !args[0]) return out(uci_get('selected_config', '-'));
+	fail('usage: peers-ss config select [N] | show');
+}
+
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  version');
 }
 
 let argv = [...ARGV];
@@ -343,6 +499,7 @@ case 'status': cmd_status(); break;
 case 'check': cmd_check(); break;
 case 'rotate': cmd_rotate(argv); break;
 case 'daemon': cmd_daemon(); break;
+case 'wizard': cmd_wizard(); break;
 case 'version': out(VERSION); break;
 default: usage(); exit(cmd ? 1 : 0);
 }

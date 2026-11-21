@@ -531,10 +531,12 @@ function writeback() {
 	let w = write_rotation(p.binding, (n) => {
 		if (n.url != p.url) {
 			n.rev = (n.rev ?? 0) + 1; n.url = p.url; n.server_id = p.server_id; n.location_id = p.location_id ?? n.location_id;
-			if (p.hist) n.history = slice([...(n.history ?? []), p.hist], -ROT_HISTORY);
-			if (p.old_server) n.blacklist = { ...blacklisted(n, ST.now()), ['' + p.old_server]: ST.now() + BLACKLIST_S };
 			n.updated_at = ST.now();
 		}
+		// history + blacklist even if another router already published the link (reconcile)
+		if (p.hist && !length(filter(n.history ?? [], (h) => h.at == p.hist.at && h.by == p.hist.by)))
+			n.history = slice([...(n.history ?? []), { ...p.hist, note: 'written after GitHub outage' }], -ROT_HISTORY);
+		if (p.old_server) n.blacklist = { ...blacklisted(n, ST.now()), ['' + p.old_server]: ST.now() + BLACKLIST_S };
 		if (n.lock?.by == X.rid) n.lock = null;
 	}, 'rotation: writeback after GitHub outage');
 	if (w.ok) { U.log('info', 'writeback after GitHub outage done'); st.applied_rev = w.obj.rev; delete st.pending_writeback; save_state(); }
