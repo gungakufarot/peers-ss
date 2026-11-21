@@ -735,7 +735,7 @@ function tick_inner() {
 			let w = write_rotation(X.binding, (n) => { n.waiting = null; }, 'rotation: waiting mode over');
 			if (w.ok) { st.rot.waiting = null; U.log('info', 'waiting mode over: link works'); }
 		}
-		if (now_m - (st.lat_mono ?? 0) > 1800) { let l = PK.latency(); if (l.ms) { st.ping_ms = l.ms; st.ping_at = ST.now(); } st.lat_mono = now_m; }
+		if (st.lat_mono == null || now_m - st.lat_mono > 1800 || now_m < st.lat_mono) { let l = PK.latency(); if (l.ms) { st.ping_ms = l.ms; st.ping_at = ST.now(); } st.lat_mono = now_m; }
 	}
 	else if (h.verdict == 'fail') {
 		st.counter = (st.counter ?? 0) + 1;
