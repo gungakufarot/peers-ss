@@ -10,6 +10,7 @@ import { RUN, q, mkdirp, sh, rand_hex } from './util.uc';
 const KDF_ITER = 20000;
 
 function sha256_bin(s) { return hexdec(sha256(s)); }
+function sha256_hex(s) { return sha256(s); }
 
 function hmac_sha256(key_bin, msg) {
 	if (length(key_bin) > 64) key_bin = sha256_bin(key_bin);
@@ -103,4 +104,4 @@ function device_key(router_id) {
 	return kdf(macs + '|' + board, hexenc('peers-ss-device|' + (router_id ?? '')), 2000);
 }
 
-export { kdf, encrypt, decrypt, encrypt_json, decrypt_json, hmac_sha256, fp, device_key, sha256 };
+export { kdf, encrypt, decrypt, encrypt_json, decrypt_json, hmac_sha256, fp, device_key, sha256_hex };

@@ -1,0 +1,6 @@
+config peers-ss 'main'
+	option enabled '1'
+	option podkop_section 'peers_ss'
+	option repo ''
+	option router_id ''
+	option contour_id ''

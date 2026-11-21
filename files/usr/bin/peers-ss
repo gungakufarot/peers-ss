@@ -1,0 +1,159 @@
+#!/usr/bin/ucode -S
+// Peers-SS: service + CLI
+'use strict';
+
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import * as U from '/usr/share/peers-ss/util.uc';
+import * as S from '/usr/share/peers-ss/secrets.uc';
+import * as API from '/usr/share/peers-ss/api.uc';
+import * as P from '/usr/share/peers-ss/ping.uc';
+
+const VERSION = '0.1.0';
+U.set_log_echo(false);
+
+function out(s) { print(s, '\n'); }
+function fail(s) { warn('peers-ss: ', s, '\n'); exit(1); }
+
+function ask(prompt) {
+	print(prompt);
+	fs.stdout.flush();
+	let l = fs.stdin.read('line');
+	return l == null ? null : trim(l);
+}
+
+function uci_get(opt, dflt) { return cursor().get('peers-ss', 'main', opt) ?? dflt; }
+function uci_set(opt, val) {
+	let c = cursor();
+	if (val == null) c.delete('peers-ss', 'main', opt); else c.set('peers-ss', 'main', opt, val);
+	c.commit('peers-ss');
+}
+
+function mask(t) { return t ? substr(t, 0, 6) + '…' + substr(t, -4) : '-'; }
+
+function fmt_date(ts) {
+	let t = localtime(+ts);
+	return sprintf('%02d.%02d.%04d', t.mday, t.mon, t.year);
+}
+
+function need_token() {
+	let t = S.get('ss_token');
+	if (!t) fail('StealthSurf token is not set (peers-ss token set)');
+	return t;
+}
+
+// ---- token ----
+function token_check(token) {
+	let p = API.profile(token);
+	if (!p.ok) return { ok: false, status: p.status, message: p.message };
+	let c = API.configs(token);
+	let v = API.vless_configs(c.ok ? c.data : []);
+	let soonest = null;
+	for (let x in v) if (soonest == null || x.expires_at < soonest) soonest = x.expires_at;
+	return { ok: true, account: p.data.id, email: p.data.email, vless: length(v), soonest };
+}
+
+function cmd_token(args) {
+	let sub = args[0] ?? 'show';
+	if (sub == 'set') {
+		let t = args[1] ?? ask('StealthSurf token (stlth_…, shown as typed): ');
+		if (!t || !match(t, /^stlth_[a-f0-9]{8}_[a-f0-9]{24}$/)) fail('token format: stlth_<8 hex>_<24 hex>');
+		let r = token_check(t);
+		if (!r.ok) fail(sprintf('token rejected by API (HTTP %d %s)', r.status, r.message ?? ''));
+		let label = args[2] ?? ask('Label (e.g. «Аккаунт Иванова»), empty = account id: ');
+		let old = S.get('ss_account');
+		let sec = { ...S.load(), ss_token: t, ss_account: r.account, ss_label: label || ('#' + r.account) };
+		S.save(sec);
+		out(sprintf('Token saved: account %d, vless configs: %d%s', r.account, r.vless, r.soonest ? ', soonest expiry ' + fmt_date(r.soonest) : ''));
+		if (old && +old != +r.account) out(sprintf('WARNING: account changed %d -> %d: this router becomes a follower for bindings of account %d', old, r.account, old));
+		if (r.vless == 0) out('WARNING: account is empty (no vless configs)');
+		U.log('info', sprintf('token set for account %d', r.account));
+		return;
+	}
+	if (sub == 'show') {
+		let t = S.get('ss_token');
+		if (!t) return out('No StealthSurf token (follower router)');
+		out(sprintf('Label: %s\nAccount: %d\nToken: %s', S.get('ss_label') ?? '-', S.get('ss_account'), args[1] == '--reveal' ? t : mask(t)));
+		return;
+	}
+	if (sub == 'check') {
+		let r = token_check(need_token());
+		if (!r.ok) fail(sprintf('token invalid (HTTP %d %s)', r.status, r.message ?? ''));
+		out(sprintf('OK: account %d, vless configs: %d, soonest expiry: %s', r.account, r.vless, r.soonest ? fmt_date(r.soonest) : '-'));
+		return;
+	}
+	if (sub == 'delete') {
+		let sec = { ...S.load() };
+		delete sec.ss_token; delete sec.ss_account; delete sec.ss_label;
+		S.save(sec);
+		out('Token deleted: router is now a follower for all bindings');
+		U.log('info', 'token deleted');
+		return;
+	}
+	fail('usage: peers-ss token set|show|check|delete');
+}
+
+// ---- configs ----
+function list_vless(token) {
+	let c = API.configs(token);
+	if (!c.ok) fail(sprintf('GET /configs failed (HTTP %d)', c.status));
+	return sort(API.vless_configs(c.data), (a, b) => a.id - b.id);
+}
+
+function cmd_configs() {
+	let v = list_vless(need_token());
+	if (!length(v)) return out('Account is empty: no vless configs');
+	let n = 1;
+	for (let c in v)
+		out(sprintf('%2d) %-32s id=%-7d loc=%-3d until %s%s', n++, c.title ?? '-', c.id, c.location_id, fmt_date(c.expires_at), c.auto_renewal ? ' (auto-renew)' : ''));
+}
+
+function cmd_config(args) {
+	if (args[0] == 'select') {
+		let v = list_vless(need_token());
+		if (!length(v)) fail('account is empty');
+		let n = args[1] ?? ask(sprintf('Config number 1-%d: ', length(v)));
+		n = +n;
+		if (!(n >= 1 && n <= length(v))) fail('wrong number');
+		let c = v[n - 1];
+		let bind = sprintf('%d:%d', S.get('ss_account'), c.id);
+		uci_set('selected_config', bind);
+		out(sprintf('Selected: %s (%s)', c.title ?? '-', bind));
+		return;
+	}
+	if (args[0] == 'show' || !args[0]) return out(uci_get('selected_config', '-'));
+	fail('usage: peers-ss config select [N] | show');
+}
+
+// ---- locations ----
+function cmd_locations() {
+	let t0 = clock(true);
+	let l = API.locations(need_token());
+	if (!l.ok) fail('GET /locations failed');
+	let excl = uci_get('exclude_locations', ['smart', 'RU']);
+	if (type(excl) != 'array') excl = [excl];
+	let cand = API.candidate_locations(l.data, excl);
+	let t1 = clock(true);
+	let r = P.rank_locations(cand);
+	let t2 = clock(true);
+	for (let x in r)
+		out(sprintf('%-4s %-22s %8s  %s', x.loc.code, x.loc.title, x.ms != null ? sprintf('%.1f ms', x.ms) : 'n/a', x.method));
+	let el = (a, b) => (b[0] - a[0]) + (b[1] - a[1]) / 1e9;
+	out(sprintf('%d locations (excluded: %s); API %.2fs, ping %.2fs', length(r), join(',', excl), el(t0, t1), el(t1, t2)));
+}
+
+function usage() {
+	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|show\n  locations\n  version');
+}
+
+let argv = [...ARGV];
+let cmd = shift(argv);
+switch (cmd) {
+case 'token': cmd_token(argv); break;
+case 'configs': cmd_configs(); break;
+case 'config': cmd_config(argv); break;
+case 'locations': cmd_locations(); break;
+case 'version': out(VERSION); break;
+default: usage(); exit(cmd ? 1 : 0);
+}
