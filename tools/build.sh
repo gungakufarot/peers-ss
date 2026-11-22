@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 OUT=dist; rm -rf "$OUT"; mkdir -p "$OUT/tree"
 cp -a files/. "$OUT/tree/"
 sed -i "s/^const VERSION = '[^']*';/const VERSION = '$VER';/" "$OUT/tree/usr/share/peers-ss/engine.uc"
+python3 tools/minify.py "$OUT/tree"
 chmod 755 "$OUT/tree/usr/bin/peers-ss" "$OUT/tree/etc/init.d/peers-ss"
 ( cd "$OUT/tree" && tar --owner=0 --group=0 --numeric-owner -czf "../peers-ss-$TAG.tar.gz" . )
 # ipk (arch all): debian-binary + control.tar.gz + data.tar.gz, outer tar.gz (opkg format)
