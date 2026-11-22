@@ -8,8 +8,9 @@ Type=simple
 EnvironmentFile=/etc/peers-ss-bot/env
 WorkingDirectory=/opt/peers-ss-bot
 ExecStart=/usr/bin/python3 -I /opt/peers-ss-bot/peers_ss_bot.py
-Restart=always
+Restart=on-failure
 RestartSec=10
+RestartPreventExitStatus=78
 # hardening: the bot writes only its own folder
 ProtectSystem=strict
 ReadWritePaths=/opt/peers-ss-bot
@@ -20,6 +21,12 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 UMask=0077
+PrivateDevices=true
+ProtectKernelModules=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

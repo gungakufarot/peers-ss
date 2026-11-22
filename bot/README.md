@@ -19,6 +19,7 @@ TELEGRAM_ADMIN_CHAT_ID=...
 BOT_KEY=<64 hex — тот же ключ бота, что в LuCI → Уведомления>
 GITHUB_TOKEN=github_pat_...   # fine-grained, Contents на peers-ss-state (запись нужна только для ежедневной копии базы)
 STATE_REPO=owner/peers-ss-state
+BACKUP_KEY=<64 hex — отдельный ключ копии базы (openssl rand -hex 32); без него копия не делается>
 DB_PATH=/opt/peers-ss-bot/bot.db
 # REMIND_AT=21:00   STORE_POLL_S=300
 ```

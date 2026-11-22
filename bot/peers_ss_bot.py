@@ -13,6 +13,7 @@ ENV = os.environ
 BOT_TOKEN = ENV.get('TELEGRAM_BOT_TOKEN', '')
 ADMIN = int(ENV.get('TELEGRAM_ADMIN_CHAT_ID', '0') or 0)
 BOT_KEY = ENV.get('BOT_KEY', '')
+BACKUP_KEY = ENV.get('BACKUP_KEY', '')   # separate from BOT_KEY (routers know BOT_KEY)
 GH_TOKEN = ENV.get('GITHUB_TOKEN', '')
 REPO = ENV.get('STATE_REPO', '')
 DB_PATH = ENV.get('DB_PATH', '/opt/peers-ss-bot/bot.db')
@@ -142,9 +143,30 @@ class TG:
         return None
 
     def send(self, chat_id, text, buttons=None):
-        p = {'chat_id': chat_id, 'text': text, 'disable_web_page_preview': True}
-        if buttons: p['reply_markup'] = {'inline_keyboard': buttons}
-        return self.call('sendMessage', **p)
+        # Telegram limit 4096 chars: long texts go in chunks (buttons on the last one)
+        chunks, cur = [], ''
+        for line in text.split('\n'):
+            if len(cur) + len(line) + 1 > 3900: chunks.append(cur); cur = ''
+            cur += ('\n' if cur else '') + line
+        chunks.append(cur)
+        res = None
+        for i, ch in enumerate(chunks):
+            p = {'chat_id': chat_id, 'text': ch, 'disable_web_page_preview': True}
+            if buttons and i == len(chunks) - 1: p['reply_markup'] = {'inline_keyboard': buttons}
+            res = self.call('sendMessage', **p)
+        return res
+
+    def deliver(self, chat_id, text):
+        """True if delivered or impossible for good (bot blocked / bad chat: 400/403) — then not retried"""
+        data = json.dumps({'chat_id': chat_id, 'text': text}).encode()
+        req = urllib.request.Request(self.base + 'sendMessage', data=data, headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=30):
+                return True
+        except urllib.error.HTTPError as e:
+            return e.code in (400, 403)
+        except Exception:
+            return False
 
 # ---------------- bot ----------------
 class Bot:
@@ -155,22 +177,45 @@ class Bot:
         self.cards = {}      # (cid, binding) -> card
         self.summaries = {}  # cid -> _contour.json
         self.data_lock = threading.Lock()
+        self.bad_paths = set()
+        self.dry = False   # --remind-now test runs do not touch the real schedule
 
     # ----- data from the store -----
+    def read_safe(self, path):
+        """one bad/foreign file or a transient GitHub error must not break the whole refresh"""
+        try:
+            o = self.st.read_obj(path, BOT_KEY)
+        except Exception as e:
+            log.warning('read %s: %s', path, redact(e)); return False, None
+        if o is None or not isinstance(o, dict):
+            if path not in self.bad_paths:
+                self.bad_paths.add(path); log.warning('cannot decrypt %s (wrong bot key or foreign file)', path)
+            return True, None
+        return True, o
+
     def refresh(self):
-        cards, summaries, alerts = {}, {}, []
+        cards, summaries, alerts = dict(self.cards), dict(self.summaries), []   # keep old values on read errors
         for e in self.st.list_dir(''):
             if e.get('type') != 'dir' or not e['name'].startswith('c'): continue
             cid = e['name']
-            for f in self.st.list_dir(cid + '/cards'):
-                o = self.st.read_obj('%s/cards/%s' % (cid, f['name']), BOT_KEY)
-                if o is None: continue
-                if f['name'] == '_contour.json': summaries[cid] = o
-                elif o.get('binding'): cards[(cid, o['binding'])] = o
-            for f in self.st.list_dir(cid + '/alerts'):
+            try: files = self.st.list_dir(cid + '/cards')
+            except Exception as ex: log.warning('list %s/cards: %s', cid, redact(ex)); continue
+            for f in files:
+                ok, o = self.read_safe('%s/cards/%s' % (cid, f['name']))
+                if not ok or o is None: continue
+                if f['name'] == '_contour.json':
+                    if o.get('cid') == cid: summaries[cid] = o
+                    continue
+                b = o.get('binding') or ''
+                # the card must belong to this contour and to the binding in its file name
+                if o.get('cid') != cid or b.replace(':', '-') + '.json' != f['name']: continue
+                cards[(cid, b)] = o
+            try: afiles = self.st.list_dir(cid + '/alerts')
+            except Exception as ex: log.warning('list %s/alerts: %s', cid, redact(ex)); continue
+            for f in afiles:
                 p = '%s/alerts/%s' % (cid, f['name'])
-                o = self.st.read_obj(p, BOT_KEY)
-                if o: alerts.append((p, o))
+                ok, o = self.read_safe(p)
+                if ok and o and o.get('cid', cid) == cid: alerts.append((p, o))
         with self.data_lock:
             self.cards, self.summaries = cards, summaries
         self.forward_alerts(alerts)
@@ -215,13 +260,13 @@ class Bot:
         today = today or now_msk().date()
         day = today.isoformat()
         stale_reported = set()
-        n = 0
-        for chat_id, cid, binding in self.db.q("SELECT b.chat_id, b.contour, b.binding FROM bindings b JOIN clients c ON c.chat_id=b.chat_id WHERE c.status='active'"):
+        n = failed = 0
+        for chat_id, cid, binding, created_at in self.db.q("SELECT b.chat_id, b.contour, b.binding, b.created_at FROM bindings b JOIN clients c ON c.chat_id=b.chat_id WHERE c.status='active'"):
             card = self.cards.get((cid, binding))
             if not card or time.time() - int(card.get('updated_at') or 0) > CARD_STALE_S:
                 if (cid, binding) not in stale_reported:
                     stale_reported.add((cid, binding))
-                    if not self.db.q("SELECT 1 FROM sent WHERE chat_id=0 AND contour=? AND binding=? AND kind='stale' AND day=?", (cid, binding, day)):
+                    if not self.quiet() and not self.db.q("SELECT 1 FROM sent WHERE chat_id=0 AND contour=? AND binding=? AND kind='stale' AND day=?", (cid, binding, day)):
                         self.db.q("INSERT INTO sent VALUES (0,?,?,'stale',?)", (cid, binding, day))
                         self.tg.send(ADMIN, '⚠️ Нет свежих данных по конфигу %s (%s): карточка старше 24 ч — клиенту напоминание не отправлено' % (binding, self.contour_name(cid)))
                 continue
@@ -231,16 +276,17 @@ class Bot:
             days = (exp - today).days
             if 1 <= days <= 3: kind, text = 'soon', 'Конфиг «%s» заканчивается %s (через %s)' % (title, exp.strftime('%d.%m.%Y'), plural_days(days))
             elif days == 0: kind, text = 'today', 'Конфиг «%s» заканчивается сегодня, %s' % (title, exp.strftime('%d.%m.%Y'))
-            elif days == -1: kind, text = 'expired', 'Конфиг «%s» истёк %s' % (title, exp.strftime('%d.%m.%Y'))
+            elif days < 0 and int(created_at or 0) < int(card['expires_at']):   # "истёк" once (also if the day after expiry was missed)
+                kind, text = 'expired', 'Конфиг «%s» истёк %s' % (title, exp.strftime('%d.%m.%Y'))
             else: continue
-            if kind == 'expired':
-                if self.db.q('SELECT 1 FROM expired_sent WHERE chat_id=? AND contour=? AND binding=? AND expires_at=?', (chat_id, cid, binding, int(card['expires_at']))): continue
-                self.db.q('INSERT INTO expired_sent VALUES (?,?,?,?)', (chat_id, cid, binding, int(card['expires_at'])))
+            if kind == 'expired' and self.db.q('SELECT 1 FROM expired_sent WHERE chat_id=? AND contour=? AND binding=? AND expires_at=?', (chat_id, cid, binding, int(card['expires_at']))): continue
             if self.db.q('SELECT 1 FROM sent WHERE chat_id=? AND contour=? AND binding=? AND kind=? AND day=?', (chat_id, cid, binding, kind, day)): continue
-            self.db.q('INSERT INTO sent VALUES (?,?,?,?,?)', (chat_id, cid, binding, kind, day))
-            if self.tg.send(chat_id, text): n += 1
-        self.db.set('last_remind_day', day)
-        log.info('reminders for %s: %d sent', day, n)
+            if not self.tg.deliver(chat_id, text): failed += 1; continue   # retried on the next tick
+            self.db.q('INSERT OR IGNORE INTO sent VALUES (?,?,?,?,?)', (chat_id, cid, binding, kind, day))
+            if kind == 'expired': self.db.q('INSERT OR IGNORE INTO expired_sent VALUES (?,?,?,?)', (chat_id, cid, binding, int(card['expires_at'])))
+            n += 1
+        if not failed and not self.dry: self.db.set('last_remind_day', day)
+        log.info('reminders for %s: %d sent, %d to retry', day, n, failed)
         return n
 
     # ----- daily encrypted DB backup into the store -----
@@ -251,7 +297,8 @@ class Bot:
             tmp = DB_PATH + '.bak'
             b = sqlite3.connect(tmp); self.db.c.backup(b); b.close()
         raw = open(tmp, 'rb').read(); os.unlink(tmp)
-        if self.st.put_obj('bot/backup.json', {'at': int(time.time()), 'db': base64.b64encode(raw).decode()}, BOT_KEY, 'bot: daily backup'):
+        if not BACKUP_KEY: return
+        if self.st.put_obj('bot/backup.json', {'at': int(time.time()), 'db': base64.b64encode(raw).decode()}, BACKUP_KEY, 'bot: daily backup'):
             self.db.set('last_backup_day', day)
             log.info('backup written (%d bytes)', len(raw))
 
@@ -283,6 +330,7 @@ class Bot:
             self.db.q('DELETE FROM clients WHERE chat_id=? AND status NOT IN (?)', (chat, 'active'))
         row = self.db.q('SELECT status FROM clients WHERE chat_id=?', (chat,))
         status = row[0][0] if row else None
+        if status == 'rejected' and not self.is_admin(chat): return   # rejected: silence
         if text == '/start' or status is None or (self.is_admin(chat) and status == 'awaiting_nick' and text.startswith('/')):
             if status == 'active': return self.tg.send(chat, self.client_configs_text(chat))
             self.db.q('INSERT OR REPLACE INTO clients (chat_id, username, first_name, nick, status, created_at) VALUES (?,?,?,?,?,?)',
@@ -291,6 +339,8 @@ class Bot:
         if status == 'awaiting_nick' and text and not text.startswith('/'):
             self.db.q("UPDATE clients SET nick=?, status='pending', username=?, first_name=? WHERE chat_id=?", (text[:64], user.get('username'), user.get('first_name'), chat))
             self.tg.send(chat, 'Спасибо! Заявка отправлена администратору.')
+            if time.time() - float(self.db.get('req_%d' % chat, 0)) < 86400: return   # max one request message per chat per day
+            self.db.set('req_%d' % chat, time.time())
             return self.notify_request(chat)
         if status == 'active': return self.tg.send(chat, self.client_configs_text(chat))
         if status == 'pending': return self.tg.send(chat, 'Заявка ещё на рассмотрении у администратора.')
@@ -306,7 +356,7 @@ class Bot:
         chat = cq['message']['chat']['id']
         data = cq.get('data', '')
         self.tg.call('answerCallbackQuery', callback_query_id=cq['id'])
-        if not self.is_admin(chat): return
+        if not (self.is_admin(chat) and self.is_admin(cq.get('from', {}).get('id'))): return
         p = data.split(':')
         if p[0] == 'm':
             return getattr(self, 'menu_' + p[1])()
@@ -317,6 +367,8 @@ class Bot:
             return self.tg.send(ADMIN, 'Контур %s: выберите конфиг' % self.contour_name(cid), btn or None)
         if p[0] == 'b':  # bind
             client, cid, binding = int(p[1]), p[2], p[3] + ':' + p[4]
+            if self.db.q('SELECT 1 FROM bindings WHERE chat_id=? AND contour=? AND binding=?', (client, cid, binding)):
+                return self.tg.send(ADMIN, 'Уже привязано')
             self.db.q('INSERT OR IGNORE INTO bindings VALUES (?,?,?,?)', (client, cid, binding, int(time.time())))
             self.db.q("UPDATE clients SET status='active' WHERE chat_id=?", (client,))
             c = self.cards.get((cid, binding)) or {}
@@ -415,11 +467,11 @@ class Bot:
 def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     for k, v in (('TELEGRAM_BOT_TOKEN', BOT_TOKEN), ('TELEGRAM_ADMIN_CHAT_ID', ADMIN), ('BOT_KEY', BOT_KEY), ('GITHUB_TOKEN', GH_TOKEN), ('STATE_REPO', REPO)):
-        if not v: sys.exit('missing %s in environment' % k)
+        if not v: print('missing %s in environment' % k, file=sys.stderr); sys.exit(78)   # EX_CONFIG: systemd does not restart
     b = Bot()
     if '--remind-now' in sys.argv:   # test helper: run reminders for a given day (--today YYYY-MM-DD), ignores the 21:00 rule
         day = dt.date.fromisoformat(sys.argv[sys.argv.index('--today') + 1]) if '--today' in sys.argv else None
-        b.refresh(); print('sent', b.run_reminders(day)); return
+        b.dry = True; b.refresh(); print('sent', b.run_reminders(day)); return
     log.info('Peers-SS bot started; reminders at %s MSK, store poll %ds', REMIND_AT, STORE_POLL_S)
     threading.Thread(target=b.scheduler, daemon=True).start()
     b.poll_updates()
