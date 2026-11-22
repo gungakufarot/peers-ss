@@ -35,7 +35,7 @@ return view.extend({
 		self.root.classList.add('busy'); document.body.appendChild(badge);
 		return c.op(op, args, self.u.contour.rev).then(function(r) {
 			self.root.classList.remove('busy'); badge.remove();
-			if (!r) return null;
+			if (!r) { c.api.ui().then(function(n) { if (n.configured) { self.u = n; self.draw(); } }); return null; }   // conflict/error: show the current state
 			self.u.contour = r.contour;
 			(self.u.routers || []).forEach(function(x) { var eo = envOf(r.contour, x.rid); x.group = eo ? eo.g : null; x.env = eo ? eo.e : null; });
 			self.draw();
@@ -43,10 +43,16 @@ return view.extend({
 		});
 	},
 	move: function(rid, g, e) {
-		var cur = envOf(this.u.contour, rid);
+		var ct = this.u.contour;
+		if (!(ct.routers || {})[rid]) return;   // dropped something that is not a router of this contour
+		var cur = envOf(ct, rid);
 		if (cur && cur.g == g && cur.e == e) return;
+		var curCfg = cur ? (cur.g ? ct.groups[cur.g].envs[cur.e].config : (ct.standalone[cur.e] || {}).config) : null;
 		if (g === null) return this.apply('make_standalone', { rid: rid });
-		return this.apply('move_router', { rid: rid, gid: g, eid: e || null });
+		if (!e) return this.apply('move_router', { rid: rid, gid: g, eid: null, config: curCfg });   // new env keeps the router's config
+		var dst = ct.groups[g].envs[e].config;
+		if (dst != curCfg && !confirm('«' + this.name(rid) + '» перейдёт ' + (dst ? 'на конфиг «' + c.cfgTitle(this.u, dst) + '»' : 'в среду без конфига (связь останется на текущей ссылке до назначения)') + '. Продолжить?')) return;
+		return this.apply('move_router', { rid: rid, gid: g, eid: e });
 	},
 	dropTarget: function(node, fn) {
 		node.addEventListener('dragover', function(ev) { ev.preventDefault(); node.classList.add('over'); });
@@ -77,7 +83,7 @@ return view.extend({
 		c.modal(self.name(rid), [
 			c.kv([ [ 'Статус', c.pill(r.status) ], [ 'Последний контакт', c.ago(r.last_contact) ], [ 'Пинг через vless', r.ping_ms ? r.ping_ms + ' мс' : '—' ],
 				[ 'Токен StealthSurf', r.has_token ? 'есть' + (r.token_label ? ' — ' + r.token_label : '') : 'нет — ведомый' ], [ 'Версия', r.version || '—' ], [ 'ID', rid ] ]),
-			E('hr'), E('div', { 'class': 'row' }, [ 'Перенести в', sel, c.btn('Перенести', function() { var p = sel.value.split('/'); ui.hideModal(); self.move(rid, p[0], p[1]); }, 'cbi-button-action') ])
+			E('hr'), E('div', { 'class': 'row' }, [ 'Перенести в', sel, c.btn('Перенести', function() { var p = sel.value.split('/'); ui.hideModal(); self.move(rid, p[0], p[1] || null); }, 'cbi-button-action') ])
 		], [
 			c.btn('Переименовать', function() { ui.hideModal(); self.rename('rename_router', { rid: rid }, self.name(rid)); }),
 			cur && cur.g ? c.btn('Сделать одиночным', function() { ui.hideModal(); self.move(rid, null, null); }) : '',
@@ -98,7 +104,9 @@ return view.extend({
 		var tile = E('div', { 'class': 'env' }, [
 			E('div', { 'class': 'head' }, [ g ? env.name : 'одиночный', E('span', { 'class': 'sp' }),
 				g ? E('button', { 'class': 'ib', 'title': 'Переименовать', 'click': function() { self.rename('rename_env', { gid: g, eid: e }, env.name); } }, '✎') : '',
+				E('button', { 'class': 'ib', 'title': 'Состав', 'click': function() { self.members(g, e, env); } }, 'ⓘ'),
 				E('button', { 'class': 'ib', 'title': 'Назначить конфиг', 'click': function() { self.assign(g, e); } }, '📄'),
+				g && (env.routers || []).length > 1 ? E('button', { 'class': 'ib', 'title': 'Разделить среду', 'click': function() { self.split(g, e, env); } }, '✂') : '',
 				g ? E('button', { 'class': 'ib', 'title': 'Пригласить роутер в эту среду', 'click': function() { self.invite(g + '/' + e); } }, '＋') : '',
 				empty ? E('button', { 'class': 'ib', 'title': 'Удалить пустую среду', 'click': function() { if (confirm('Удалить пустую среду «' + env.name + '»?')) self.apply('delete_env', { gid: g, eid: e }); } }, '🗑') : '' ]),
 			cfgLine,
@@ -148,6 +156,7 @@ return view.extend({
 			list.innerHTML = '';
 			list.appendChild(E('p', { 'class': 'spinning' }, sel.value == u.rid ? 'Запрос к StealthSurf…' : 'Запрос через выбранный роутер (до минуты)…'));
 			c.api.configs(sel.value == u.rid ? '' : sel.value).then(function(res) {
+				res = res || { error: 'нет ответа' };
 				if (res.pending && tries < 40) return window.setTimeout(function() { fetch(tries + 1); }, 3000);
 				list.innerHTML = '';
 				if (!res.ok) return list.appendChild(E('p', { 'style': 'color:var(--pss-bad)' }, res.error || 'роутер не ответил'));
@@ -164,6 +173,38 @@ return view.extend({
 		if (src.length) fetch(0);
 	},
 	envBinding: function(g, e) { var ct = this.u.contour; return g ? ct.groups[g].envs[e].config : (ct.standalone[e] || {}).config; },
+
+	// «Состав» (spec §8): routers with status and last contact, config with location/server/expiry
+	members: function(g, e, env) {
+		var self = this, u = self.u, rot = (u.rotations || {})[env.config] || {}, card = (u.cards || {})[env.config] || {};
+		c.modal('Состав: ' + (g ? env.name : 'одиночный'), [
+			c.kv([ [ 'Конфиг', env.config ? c.cfgTitle(u, env.config) + ' (' + env.config + ')' : 'не назначен' ],
+				[ 'Локация / сервер', rot.server_id ? (rot.location || rot.location_id) + ' / ' + rot.server_id : '—' ],
+				[ 'Действует до', c.fmtDate(rot.expires_at || card.expires_at) ], [ 'Роутеров', String((env.routers || []).length) ] ]),
+			E('hr'),
+			E('ul', { 'class': 'feed' }, (env.routers || []).map(function(rid) {
+				var r = self.rec(rid);
+				return E('li', { 'class': 'row' }, [ c.dot(r.status), E('b', self.name(rid)), c.pill(r.status), E('span', { 'class': 'muted' }, 'контакт ' + c.ago(r.last_contact) + (r.ping_ms ? ' · ' + r.ping_ms + ' мс' : '') + (r.has_token ? ' · 🔑' : '')) ]);
+			}))
+		]);
+	},
+
+	// split part of an environment into a new one with its own config (archive / known config / later)
+	split: function(g, e, env) {
+		var self = this, u = self.u;
+		var checks = (env.routers || []).map(function(rid) { return E('label', { 'style': 'display:block;margin:4px 0' }, [ E('input', { 'type': 'checkbox', 'value': rid }), ' ' + self.name(rid) ]); });
+		var arch = (u.contour.archive || []).filter(function(a) { return a.group == g; });
+		var known = Object.keys(u.rotations || {}).filter(function(b) { return b != env.config && !arch.some(function(a) { return a.config == b; }); });
+		var cfg = E('select', { 'class': 'cbi-input-select' }, [ E('option', { 'value': '' }, 'назначить позже') ]
+			.concat(arch.map(function(a) { return E('option', { 'value': a.config }, 'из архива: ' + c.cfgTitle(u, a.config)); }))
+			.concat(known.map(function(b) { return E('option', { 'value': b }, c.cfgTitle(u, b)); })));
+		c.modal('Разделить среду «' + env.name + '»', [ E('p', 'Какие роутеры перенести в новую среду:'), E('div', checks), E('p', 'Конфиг новой среды:'), cfg ], [
+			c.btn('Разделить', function() {
+				var rids = checks.map(function(l) { return l.firstChild; }).filter(function(i) { return i.checked; }).map(function(i) { return i.value; });
+				if (!rids.length || rids.length >= (env.routers || []).length) return alert('Выберите часть роутеров (не всех)');
+				ui.hideModal(); self.apply('split_env', { gid: g, eid: e, rids: rids, config: cfg.value || null });
+			}, 'cbi-button-action') ]);
+	},
 
 	merge: function(g) {
 		var self = this, grp = self.u.contour.groups[g];
@@ -233,6 +274,7 @@ return view.extend({
 			E('h2', 'Роутеры — «' + (ct.name || u.cid) + '»'),
 			E('div', { 'class': 'row' }, [ c.btn('＋ Группа', function() { self.apply('create_group', {}); }), c.btn('＋ Добавить роутер', function() { self.invite(); }, 'cbi-button-add') ])
 		]));
+		var sb = c.staleBanner(u); if (sb) root.appendChild(sb);
 		root.appendChild(E('p', { 'class': 'muted' }, '🖱 Перетащите роутер в другую среду, на «＋ новая среда» или в «Одиночные». На телефоне — нажмите на роутер. 🔑 — есть токен StealthSurf.'));
 		Object.keys(ct.groups || {}).forEach(function(g) { root.appendChild(self.groupCard(g)); });
 		root.appendChild(self.standaloneCard());
@@ -248,8 +290,8 @@ return view.extend({
 		// statuses refresh; the layout is redrawn only when the contour changed elsewhere and no dialog is open
 		poll.add(function() {
 			return c.api.ui().then(function(n) {
-				if (!n.configured || self.dragging || document.querySelector('.modal')) return;
-				var changed = n.contour.rev != self.u.contour.rev;
+				if (!n.configured || self.dragging || c.modalOpen()) return;
+				var changed = n.contour.rev > self.u.contour.rev;
 				self.u.routers = n.routers; self.u.rotations = n.rotations; self.u.invites = n.invites; self.u.age = n.age;
 				if (changed) self.u.contour = n.contour;
 				self.draw();

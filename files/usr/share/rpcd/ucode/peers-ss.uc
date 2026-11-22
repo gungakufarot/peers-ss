@@ -95,7 +95,8 @@ function alerts_view(x) {
 
 // save a contour edit with CAS; rev = contour rev the page was opened with (spec §8 concurrent edits)
 // keep the UI snapshot in step with edits made from this page (the daemon refreshes it every tick anyway)
-function ui_patch(fn) {
+function ui_patch(fn, dirty) {
+	if (dirty) fs.writefile(E.UI_DIRTY, '1');
 	let u = U.readjson(E.UI_FILE);
 	if (!u) return;
 	fn(u);
@@ -128,16 +129,21 @@ const methods = {
 		call: function() {
 			let u = U.readjson(E.UI_FILE);
 			if (!u) {
-				let x = ctx();
-				if (!x) return { configured: false, version: E.VERSION, podkop: PK.check_podkop() };
-				E.load_state();
-				E.recs_refresh(true);
-				u = E.write_ui(true);
+				// no snapshot yet (reboot / service stopped): answer at once from local data, refresh in background
+				if (!E.init()) return { configured: false, version: E.VERSION, podkop: PK.check_podkop() };
+				let x = E.ctx(), cc = ST.get_cached(C.p_contour(x.cid));
+				if (!cc.ok) { job_start('snapshot'); return { configured: false, pending: true, version: E.VERSION }; }
+				u = { at: 0, version: E.VERSION, rid: x.rid, cid: x.cid, repo: x.repo, contour: cc.obj, settings: C.settings(cc.obj),
+					binding: C.binding_of(cc.obj, x.rid), routers: map(sort(keys(cc.obj.routers ?? {})), (rid) => ({ rid, name: C.router_name(cc.obj, rid), me: rid == x.rid })),
+					rotations: {}, cards: {}, alerts: [], invites: [], state: U.readjson(U.RUN + '/state.json') ?? {}, podkop_section: PK.section(), stale: true };
+				job_start('snapshot');
 			}
 			u.configured = true;
 			u.age = time() - (u.at ?? 0);
+			// token fields live (the snapshot may be a tick old after a change)
 			let t = S.get('ss_token');
 			u.token_masked = t ? mask(t) : null;
+			u.has_token = !!t; u.account = t ? +S.get('ss_account') : null; u.token_label = t ? S.get('ss_label') : null;
 			u.jobs = {};
 			for (let j in JOBS) { let s = U.readjson(job_file(j)); if (s?.running) u.jobs[j] = true; }
 			return u;
@@ -254,6 +260,7 @@ const methods = {
 			let x = ctx();
 			if (!x?.bot_key) return { error: 'no bot key in contour settings' };
 			let ok = E.alert('test-' + time(), 'Тестовый алерт с ' + C.router_name(x.contour, x.rid));
+			fs.writefile(E.UI_DIRTY, '1');
 			return { ok };
 		}
 	},
@@ -287,7 +294,7 @@ const methods = {
 			let x = ctx();
 			if (!x) return { error: 'not configured' };
 			let r = INV.create(x, req.args.group || null, req.args.env || null, +(req.args.hours || 24));
-			if (r.ok) ui_patch((u) => { u.invites = [{ id: r.id, group: req.args.group || null, env: req.args.env || null, created_at: time(), expires_at: r.expires_at, active: true }, ...(u.invites ?? [])]; });
+			if (r.ok) ui_patch((u) => { u.invites = [{ id: r.id, group: req.args.group || null, env: req.args.env || null, created_at: time(), expires_at: r.expires_at, active: true }, ...(u.invites ?? [])]; }, true);
 			return r;
 		}
 	},
@@ -297,7 +304,7 @@ const methods = {
 			let x = ctx();
 			if (!x) return { error: 'not configured' };
 			let r = INV.revoke(x, req.args.id);
-			if (r.ok) ui_patch((u) => { for (let i in u.invites ?? []) if (i.id == req.args.id) { i.revoked = true; i.active = false; } });
+			if (r.ok) ui_patch((u) => { for (let i in u.invites ?? []) if (i.id == req.args.id) { i.revoked = true; i.active = false; } }, true);
 			return r;
 		}
 	},

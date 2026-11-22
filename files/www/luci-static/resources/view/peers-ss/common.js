@@ -38,7 +38,7 @@ var CSS = '\
 .pss{--pss-line:rgba(127,127,127,.25);--pss-soft:rgba(127,127,127,.07);--pss-ok:#1a7f37;--pss-warn:#b08800;--pss-bad:#cf222e;--pss-mute:#6e7781;--pss-acc:#0969da}\
 .pss h2{margin:.2em 0 .6em}\
 .pss .card{border:1px solid var(--pss-line);border-radius:12px;padding:16px 18px;margin:0 0 16px;background:var(--pss-soft)}\
-.pss .card h3{margin:0 0 12px;font-size:1.05em;display:flex;align-items:center;gap:8px}\
+.pss .card h3{margin:0 0 12px;font-size:1.05em;display:flex;align-items:center;gap:8px;flex-wrap:wrap}\
 .pss .card h3 .sp{flex:1}\
 .pss .card h3 .pill{align-self:center;line-height:1.5;font-weight:500}\
 .pss .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}\
@@ -165,6 +165,22 @@ return baseclass.extend({
 		];
 		for (var i = 0; i < rules.length; i++) if ((m = String(msg).match(rules[i][0]))) return rules[i][1](m);
 		return msg;
+	},
+
+	modalOpen: function() { return document.body.classList.contains('modal-overlay-active'); },
+	envOf: function(ct, rid) {
+		var res = null;
+		Object.keys(ct.groups || {}).forEach(function(g) {
+			Object.keys(ct.groups[g].envs || {}).forEach(function(e) { if ((ct.groups[g].envs[e].routers || []).indexOf(rid) >= 0) res = { g: g, e: e, env: ct.groups[g].envs[e] }; });
+		});
+		Object.keys(ct.standalone || {}).forEach(function(e) { if ((ct.standalone[e].routers || []).indexOf(rid) >= 0) res = { g: null, e: e, env: ct.standalone[e] }; });
+		return res;
+	},
+	// the service writes the snapshot every check; warn if it stopped
+	staleBanner: function(u) {
+		var iv = ((u.settings || {}).check_interval_s || 45) * 3 + 60;
+		if (u.stale || u.age > iv) return SE('div', { 'class': 'banner warn' }, 'Служба Peers-SS давно не обновляла данные (' + (u.stale ? 'нет снимка' : Math.round(u.age / 60) + ' мин') + '). Проверьте, запущена ли она: /etc/init.d/peers-ss start');
+		return null;
 	},
 
 	notify: function(text, kind) { ui.addNotification(null, SE('p', text), kind || 'info'); },

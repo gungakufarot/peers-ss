@@ -40,7 +40,7 @@ return view.extend({
 		return E('div', { 'class': 'card' }, [
 			E('h3', [ '🔑 Токен StealthSurf', E('span', { 'class': 'sp' }), u.has_token ? E('span', { 'class': 'pill ok' }, 'роутер ведущий') : E('span', { 'class': 'pill mute' }, 'ведомый роутер') ]),
 			u.has_token ? c.kv([ [ 'Метка', u.token_label || '—' ], [ 'Аккаунт', String(u.account) ], [ 'Токен', E('span', { 'class': 'row', 'style': 'gap:6px' }, [ val,
-				E('button', { 'class': 'ib', 'click': function(ev) { shown = !shown; c.api.tokenGet(shown).then(function(t) { val.textContent = t.token; ev.target.textContent = shown ? '🙈' : '👁'; }); } }, '👁') ]) ] ])
+				E('button', { 'class': 'ib', 'click': function(ev) { shown = !shown; c.api.tokenGet(shown).then(function(t) { if (t && t.token) { val.textContent = t.token; ev.target.textContent = shown ? '🙈' : '👁'; } else c.notify('Не удалось получить токен', 'danger'); }); } }, '👁') ]) ] ])
 				: E('p', { 'class': 'muted' }, 'Без токена роутер только применяет новые ссылки; ротацию делает роутер контура с токеном того же аккаунта.'),
 			info,
 			E('div', { 'class': 'right' }, [
@@ -100,8 +100,8 @@ return view.extend({
 		var u = data[0], ev = data[1] || {};
 		var root = E('div', { 'class': 'pss' });
 		if (!u.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, 'Роутер не зарегистрирован в контуре.')); return root; }
-		[ E('h2', 'Токен и диагностика'), this.tokenCard(u), this.diagCard(u), this.historyCard(u), this.logCard(ev),
-			c.footer(u, function() { c.refresh(function() { window.location.reload(); }); }) ].forEach(function(n) { root.appendChild(n); });
+		[ E('h2', 'Токен и диагностика'), c.staleBanner(u) || '', this.tokenCard(u), this.diagCard(u), this.historyCard(u), this.logCard(ev),
+			c.footer(u, function() { c.refresh(function() { window.location.reload(); }); }) ].forEach(function(n) { if (n) root.appendChild(n); });
 		return root;
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null

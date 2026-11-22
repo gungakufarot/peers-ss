@@ -17,8 +17,9 @@ return view.extend({
 		var exp = rot.expires_at || card.expires_at, left = c.daysLeft(exp);
 		var last = (rot.history || []).slice(-1)[0];
 		var me = (u.routers || []).filter(function(r) { return r.me; })[0] || {};
-		var g = me.group ? (u.contour.groups[me.group] || {}) : null;
-		var envName = g ? g.envs[me.env].name : 'одиночный';
+		var eo = c.envOf(u.contour, u.rid);
+		var g = eo && eo.g ? u.contour.groups[eo.g] : null;
+		var envName = eo ? (eo.g ? eo.env.name : 'одиночный') : 'вне среды';
 		return E('div', { 'class': 'card' }, [
 			E('div', { 'class': 'hero' }, [
 				E('div', [
@@ -27,7 +28,7 @@ return view.extend({
 					E('div', { 'class': 'muted' }, (me.name || u.rid) + ' · ' + (g ? g.name + ' / ' : '') + envName + ' · контур «' + (u.contour.name || u.cid) + '»')
 				]),
 				E('div', { 'class': 'row' }, [
-					c.btn('Проверить сейчас', function() { c.job('check', 'Проверка'); }, 'cbi-button-action'),
+					c.btn('Проверить сейчас', function() { c.job('check', 'Проверка', function() { c.api.ui().then(function(n) { if (n.configured && !document.querySelector('details[open]')) location.reload(); }); }); }, 'cbi-button-action'),
 					u.has_token && u.binding ? c.btn('Сменить сервер', function() {
 						if (confirm('Перенести конфиг на другой сервер сейчас? Это касается ВСЕХ роутеров с этим конфигом.')) c.job('rotate', 'Смена сервера');
 					}, 'cbi-button-negative') : ''
@@ -45,6 +46,7 @@ return view.extend({
 
 	banners: function(u) {
 		var st = u.state || {}, rot = (u.rotations || {})[u.binding] || {}, out = [];
+		var sb = c.staleBanner(u); if (sb) out.push(sb);
 		if (rot.waiting) out.push(E('div', { 'class': 'banner bad' }, 'Режим ожидания: ротация не помогает (техработы или массовая блокировка). Следующая попытка — ' + c.fmtTime(rot.waiting.next_try) + '.'));
 		if (u.podkop && u.podkop.ok === false) out.push(E('div', { 'class': 'banner bad' }, 'podkop: ' + u.podkop.reason + ' — нужна перенастройка.'));
 		if (u.github_error) out.push(E('div', { 'class': 'banner warn' }, 'Хранилище GitHub недоступно (' + u.github_error + '). Роутер работает по последним данным.'));
@@ -126,7 +128,7 @@ return view.extend({
 		var self = this, root = E('div', { 'class': 'pss' });
 		var draw = function(d) {
 			root.innerHTML = '';
-			if (!d.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, 'Роутер не зарегистрирован в контуре. Запустите install.sh.')); return; }
+			if (!d.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, d.pending ? 'Данные загружаются из хранилища — обновите страницу через минуту.' : 'Роутер не зарегистрирован в контуре. Запустите install.sh.')); return; }
 			var redraw = function() { c.api.ui().then(draw); };
 			[ E('h2', 'Peers-SS') ].concat(self.banners(d), [ self.hero(d), self.contourCard(d), self.alertsCard(d),
 				self.settingsCard(d, redraw), self.notifyCard(d, redraw), self.securityCard(d), c.footer(d, function() { c.refresh(redraw); }) ])
@@ -138,7 +140,7 @@ return view.extend({
 			return c.api.ui().then(function(n) {
 				if (!n.configured) return;
 				var hero = root.querySelector('.card');
-				if (hero && !root.querySelector('details[open]')) draw(n);
+				if (hero && !root.querySelector('details[open]') && !c.modalOpen()) draw(n);
 			});
 		}, 20);
 		return root;

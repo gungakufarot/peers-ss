@@ -313,6 +313,7 @@ function cmd_snapshot() {
 	E.load_state();
 	E.recs_refresh(true);
 	E.write_ui(true);
+	fs.writefile(E.UI_DIRTY, '1');   // the daemon re-reads invites/alerts/cards on its next tick too
 	out('UI snapshot refreshed');
 }
 

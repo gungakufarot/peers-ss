@@ -14,7 +14,7 @@ import * as P from './ping.uc';
 import { fp } from './crypto.uc';
 import { try_rekey, switch_key } from './invite.uc';
 
-const VERSION = '1.0.2';
+const VERSION = '1.1.0';
 const STATE = U.RUN + '/state.json';
 const LOCK_TTL = 180;
 const ROT_HISTORY = 10;
@@ -762,7 +762,9 @@ function rotation_view(o) {
 		history: o.history ?? [], updated_at: o.updated_at, link_fp: o.url ? fp(o.url) : null };
 }
 
+const UI_DIRTY = U.RUN + '/ui.dirty';   // touched by LuCI after invite/alert changes and by `peers-ss snapshot`
 function ui_slow(force) {
+	if (fs.stat(UI_DIRTY)) { force = true; fs.unlink(UI_DIRTY); }
 	if (!force && UI_SLOW && ST.mono() - UI_SLOW_MONO < 300) return UI_SLOW;
 	let cards = {}, alerts = [], invites = [];
 	if (X.bot_key) {
@@ -804,6 +806,9 @@ function write_ui(force) {
 		state: { status: st.status, counter: st.counter, ping_ms: st.ping_ms, ping_at: st.ping_at, last_check: st.last_check,
 			layers: st.layers, diag_ok: st.diag_ok, diag_fails: st.diag_fails, last_rotation: st.last_rotation,
 			ignore_until: st.ignore_until }, podkop: st.podkop, github_error: ST.last_error() };
+	// never roll back a newer contour that LuCI already wrote into the snapshot
+	let prev = U.readjson(UI_FILE);
+	if (prev?.contour?.rev > (ui.contour?.rev ?? 0)) { ui.contour = prev.contour; ui.settings = prev.settings; }
 	U.mkdirp(U.RUN);
 	U.writejson(UI_FILE, ui);
 	return ui;
@@ -910,16 +915,17 @@ function tick_inner() {
 		ensure_rotation_files();
 		heartbeat();
 		if (now_m - (st.watch_mono ?? 0) > 600 && length(keys(recs))) { watchdog(recs); write_summary(recs); st.watch_mono = now_m; }
-		write_ui();
 	}
 }
 
 function tick() {
 	if (!engine_lock(60)) { U.log('info', 'tick skipped: another Peers-SS process is working'); return; }
 	try { tick_inner(); } catch (e) { U.log('error', 'tick failed: ' + e + '\n' + (e.stacktrace?.[0]?.context ?? '')); }
+	// snapshot on every tick (also no_binding / podkop changed / GitHub down: status must stay fresh)
+	try { write_ui(); } catch (e) { U.log('error', 'ui snapshot failed: ' + e); }
 	save_state();
 	engine_unlock();
 }
 
 export { VERSION, init, tick, rotate, refresh_contour, deliver, heartbeat, read_routers, alert, write_rotation, router_record,
-	load_state, save_state, apply_link, first_token_router, ctx, state, write_ui, recs_refresh, UI_FILE };
+	load_state, save_state, apply_link, first_token_router, ctx, state, write_ui, recs_refresh, UI_FILE, UI_DIRTY };
