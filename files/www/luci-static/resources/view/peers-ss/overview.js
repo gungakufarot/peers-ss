@@ -4,6 +4,8 @@
 'require poll';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 return view.extend({
 	load: function() { return c.api.status(); },
 

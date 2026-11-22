@@ -100,7 +100,9 @@ say "Peers-SS $(/usr/bin/peers-ss version) files installed"
 
 # ---- 3. interactive part (ucode) ----
 if [ -n "$JOIN" ]; then
+	if [ "$JOIN" = "-" ]; then ask "Invite code PSS1.… : "; JOIN="$REPLY"; fi
 	PEERS_SS_JOIN="$JOIN" /usr/bin/peers-ss wizard </dev/tty
+	say "Tip: the invite command contains a GitHub token — clear your shell history (history -c / rm ~/.ash_history)"
 else
 	/usr/bin/peers-ss wizard </dev/tty
 fi

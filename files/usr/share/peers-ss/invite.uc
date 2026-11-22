@@ -46,12 +46,22 @@ function create(x, group_id, env_id, hours) {
 		command: 'wget -qO- https://raw.githubusercontent.com/gungakufarot/peers-ss/main/install.sh | sh -s -- --join ' + code };
 }
 
+// registration failed after the claim: give the invite back (only our own claim)
+function release(cid, iid, rid) {
+	return ST.update(C.p_invite(cid, iid), (i) => i?.used_by == rid ? { ...i, used_by: null, used_at: null } : null, { message: 'invite ' + iid + ': released' });
+}
+
 function list(x) {
 	let files = ST.list_dir(x.cid + '/invites') ?? [], out = [], now = ST.now();
 	for (let f in files) {
 		let r = ST.get(x.cid + '/invites/' + f.name);
 		if (!r.ok) continue;
 		let i = r.obj;
+		// housekeeping: used/revoked/expired invites older than 30 days are deleted
+		if ((i.used_by || i.revoked || i.expires_at < now) && now - i.expires_at > 30 * 86400) {
+			ST.delete_raw(x.cid + '/invites/' + f.name, r.sha, 'invite ' + i.id + ': cleanup');
+			continue;
+		}
 		push(out, { id: i.id, group: i.group, env: i.env, created_at: i.created_at, expires_at: i.expires_at,
 			used_by: i.used_by, used_name: i.used_by ? C.router_name(x.contour, i.used_by) : null, used_at: i.used_at,
 			revoked: i.revoked, active: !i.revoked && !i.used_by && i.expires_at > now,
@@ -73,10 +83,11 @@ function claim(cid, iid, secret, new_rid) {
 	let reason = null, inv = null;
 	let w = ST.update(C.p_invite(cid, iid), (i) => {
 		if (!i) { reason = 'invite does not exist'; return null; }
+		// secret first: without it nothing about the invite state is revealed
+		if (i.secret_hash != secret_hash(secret)) { reason = 'invite secret does not match'; return null; }
 		if (i.revoked) { reason = 'invite was revoked'; return null; }
 		if (i.used_by) { reason = 'invite was already used'; return null; }
 		if (ST.now() > i.expires_at) { reason = 'invite expired'; return null; }
-		if (i.secret_hash != secret_hash(secret)) { reason = 'invite secret does not match'; return null; }
 		inv = { ...i, used_by: new_rid, used_at: ST.now() };
 		return inv;
 	}, { message: 'invite ' + iid + ': used' });
@@ -85,36 +96,57 @@ function claim(cid, iid, secret, new_rid) {
 	return { ok: true, invite: inv };
 }
 
-// ---- password change: re-encrypt contour files, leave rekeys/<fp(old)>.json (new key under old key) for other routers ----
+// ---- password change ----
+// 1) rekeys/<id(old key)>.json = new key encrypted with the old key (other routers follow it, also through chains);
+// 2) this router switches at once and keeps the old key as a read-only fallback;
+// 3) every contour-key file is re-encrypted (CAS with retries), contour.json last. A partial failure is harmless:
+//    such files stay readable with the old key (fallback ring) and get the new key on their next write.
+// Note: whoever knows an old password can follow the chain — a password change does not lock out a leaked password
+// (replace the GitHub token for that).
 function rekey_path(cid, key) { return cid + '/rekeys/' + substr(sha256_hex('peers-ss/rekey\x00' + key), 0, 16) + '.json'; }
+
+function switch_key(new_key, old_key) {
+	let prev = filter([old_key, ...(S.get('prev_keys') ?? [])], (k) => k && k != new_key);
+	S.save({ ...S.load(), contour_key: new_key, prev_keys: slice(prev, 0, 3) });
+	ST.set_key(new_key);
+	ST.set_keyring(prev);
+}
 
 function change_password(x, new_password) {
 	let old_key = x.key, new_key = contour_key(new_password, x.cid);
-	// 1. publish the new key for routers that still have the old one
-	let rk = ST.put(rekey_path(x.cid, old_key), { new_key, at: ST.now(), by: x.rid }, null, 'contour: rekey', old_key);
-	if (!rk.ok && !rk.conflict) return { error: 'cannot write rekey file (HTTP ' + rk.status + ')' };
-	// 2. re-encrypt every contour-key file
-	let paths = [C.p_contour(x.cid)];
-	for (let d in ['routers', 'rotations', 'invites', 'requests'])
+	if (new_key == old_key) return { error: 'the new password is the same' };
+	let at = ST.now();
+	let rk = ST.update(rekey_path(x.cid, old_key), () => ({ new_key, at, by: x.rid }), { key: old_key, message: 'contour: rekey' });
+	if (!rk.ok) return { error: 'cannot write rekey file: ' + (rk.err ?? '') };
+	// a reused password (A→B→A): the old rekey file of the new key points back to a stale key — remove it
+	let stale = ST.get_raw(rekey_path(x.cid, new_key), false);
+	if (stale.ok) ST.delete_raw(rekey_path(x.cid, new_key), stale.sha, 'contour: drop stale rekey');
+	switch_key(new_key, old_key);
+	let paths = [];
+	for (let d in ['routers', 'rotations', 'invites'])
 		for (let f in ST.list_dir(x.cid + '/' + d) ?? []) push(paths, x.cid + '/' + d + '/' + f.name);
+	push(paths, C.p_contour(x.cid));   // last
 	let failed = [];
 	for (let p in paths) {
-		let r = ST.get(p, old_key);
-		if (!r.ok) { if (!r.missing) push(failed, p); continue; }
-		let w = ST.put(p, r.obj, r.sha, 'contour: re-encrypt', new_key);
+		let w = ST.update(p, (o) => o, { message: 'contour: re-encrypt with the new key' });   // read: any key of the ring, write: new key
 		if (!w.ok) push(failed, p);
 	}
-	S.set('contour_key', new_key);
-	ST.set_key(new_key);
-	U.log('info', sprintf('contour password changed (%d files re-encrypted, %d failed)', length(paths) - length(failed), length(failed)));
-	return { ok: !length(failed), files: length(paths), failed };
+	U.log('info', sprintf('contour password changed: %d files re-encrypted, %d left for later', length(paths) - length(failed), length(failed)));
+	return { ok: true, files: length(paths), failed };
 }
 
-// other routers: current key cannot decrypt -> look for a rekey file made with our (old) key
+// other routers: follow rekeys from the current key (chain of changes); returns the newest key or null
 function try_rekey(cid, key) {
-	let r = ST.get(rekey_path(cid, key), key);
-	if (!r.ok || !r.obj.new_key) return null;
-	return r.obj.new_key;
+	let cur = key, found = null, seen = { [key]: true };
+	for (let i = 0; i < 5; i++) {
+		let r = ST.get(rekey_path(cid, cur), cur);
+		if (!r.ok || !r.obj.new_key || seen[r.obj.new_key]) break;   // loop guard
+		seen[r.obj.new_key] = true;
+		found = cur = r.obj.new_key;
+	}
+	// only switch to a key that really opens the contour (contour.json is re-encrypted last)
+	if (found && !ST.get(C.p_contour(cid), found).ok) return null;
+	return found;
 }
 
-export { encode, decode, create, list, revoke, claim, change_password, try_rekey, secret_hash };
+export { encode, decode, create, list, revoke, claim, release, change_password, try_rekey, switch_key, secret_hash };

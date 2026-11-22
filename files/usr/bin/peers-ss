@@ -405,12 +405,27 @@ function wizard_finish(link) {
 		print_apply(r);
 		if (!r.ok) out('WARNING: diagnostics did not pass — check LuCI → podkop → Diagnostics');
 	} else out('No config assigned yet: this router works as a follower until a config is assigned (LuCI or `peers-ss config assign`).');
+	uci_set('setup_done', '1');
 	system('/etc/init.d/peers-ss enable; /etc/init.d/peers-ss restart >/dev/null 2>&1');
 	out('Peers-SS service started. LuCI: Services → Peers-SS.');
 }
 
+// registration done but the wizard stopped before the end (abort, network): continue from the token/podkop step
+function resume_wizard() {
+	out('Finishing the interrupted setup of ' + uci_get('router_id') + '…');
+	if (!S.get('ss_token')) {
+		let t = ask('StealthSurf token stlth_… (Enter = skip, follower): ');
+		if (t) { let r = token_check(t); if (r.ok) S.save({ ...S.load(), ss_token: t, ss_account: r.account, ss_label: '#' + r.account }); else out('token rejected — add it later with `peers-ss token set`'); }
+	}
+	uci_set('podkop_section', choose_podkop_section());
+	let x = need_engine();
+	let rf = x.binding ? ST.get(C.p_rotation(x.cid, x.binding)) : null;
+	wizard_finish(rf?.ok ? rf.obj.url : null);
+}
+
 // ---- join wizard (spec §4, mode B) ----
 function cmd_join_wizard(code) {
+	if (uci_get('contour_id') && uci_get('setup_done') != '1') return resume_wizard();
 	if (uci_get('contour_id')) fail(sprintf('this router is already in contour %s — run `peers-ss uninstall` first', uci_get('contour_id')));
 	let inv = INV.decode(code);
 	if (!inv) fail('invalid invite code (must start with PSS1.)');
@@ -429,8 +444,13 @@ function cmd_join_wizard(code) {
 	let rid = SU.new_rid();
 	let cl = INV.claim(inv.cid, inv.iid, inv.secret, rid);
 	if (!cl.ok) fail('invite rejected: ' + cl.err);
-	let r = SU.register_router(inv.cid, o.key, inv.repo, inv.gh, { group_id: cl.invite.group, env_id: cl.invite.env }, rid);
-	if (!r.ok) fail(r.err + ' (the invite is used up — create a new one)');
+	let g = cl.invite.group, e = cl.invite.env;
+	if ((g && !o.contour.groups?.[g]) || (g && e && !o.contour.groups[g].envs?.[e])) {
+		INV.release(inv.cid, inv.iid, rid);
+		fail('the group/environment of this invite no longer exists — create a new invite');
+	}
+	let r = SU.register_router(inv.cid, o.key, inv.repo, inv.gh, { group_id: g, env_id: e }, rid);
+	if (!r.ok) { INV.release(inv.cid, inv.iid, rid); fail(r.err + ' (invite released, you can retry)'); }
 	out(sprintf('Registered as %s (%s)%s', r.name, r.rid, r.binding ? ', config ' + r.binding : ', no config in this environment yet'));
 	let bacc = r.binding ? C.parse_binding(r.binding).account : null;
 	while (true) {
@@ -458,6 +478,7 @@ function cmd_join_wizard(code) {
 function cmd_wizard() {
 	let join = getenv('PEERS_SS_JOIN');
 	if (join) return cmd_join_wizard(join);
+	if (uci_get('contour_id') && uci_get('setup_done') != '1') return resume_wizard();
 	if (uci_get('contour_id')) {
 		out(sprintf('This router is already in contour %s (%s). Settings kept; service restarted.', uci_get('contour_id'), uci_get('router_id')));
 		system('/etc/init.d/peers-ss enable; /etc/init.d/peers-ss restart >/dev/null 2>&1');
@@ -528,8 +549,28 @@ function cmd_config(args) {
 }
 
 // ---- uninstall (spec §4): files + service + router entry in contour.json; podkop section and its link stay ----
+function cmd_passwd_apply() {
+	let f = U.RUN + '/passwd.req';
+	let pw = fs.readfile(f);
+	fs.unlink(f);
+	if (!pw) fail('no pending password change');
+	let x = need_engine();
+	out('Re-encrypting contour files with the new key…');
+	let r = INV.change_password(x, pw);
+	if (r.error) fail(r.error);
+	out(sprintf('Done: %d files, left for later: %d. Other routers switch automatically (within 10 min).', r.files, length(r.failed)));
+}
+
 function cmd_uninstall(args) {
-	if (index(args, '--yes') < 0 && lc(ask('Remove Peers-SS from this router? podkop and its current link stay. [y/N] ') ?? '') != 'y') fail('cancelled');
+	let from_opkg = index(args, '--from-opkg') >= 0;
+	if (!from_opkg && E.init() && E.refresh_contour()) {
+		let x = E.ctx(), recs = E.read_routers();
+		if (x.binding && x.token) {
+			let others = filter(C.binding_routers(x.contour, x.binding), (r) => r != x.rid && recs[r]?.has_token && +recs[r].account == +x.acct);
+			if (!length(others)) out('WARNING: this is the only router with a StealthSurf token for ' + x.binding + ' — after removal nobody can rotate it');
+		}
+	}
+	if (index(args, '--yes') < 0 && !from_opkg && lc(ask('Remove Peers-SS from this router? podkop and its current link stay. [y/N] ') ?? '') != 'y') fail('cancelled');
 	system('/etc/init.d/peers-ss stop >/dev/null 2>&1; /etc/init.d/peers-ss disable >/dev/null 2>&1');
 	if (E.init() && E.refresh_contour()) {
 		let x = E.ctx();
@@ -544,10 +585,11 @@ function cmd_uninstall(args) {
 		let rr = ST.get_raw(C.p_router(x.cid, x.rid));
 		if (rr.ok) ST.delete_raw(C.p_router(x.cid, x.rid), rr.sha, 'router ' + x.rid + ' uninstalled');
 	} else out('WARNING: contour not reachable — remove this router in LuCI → Devices on another router');
-	let pkg = system('opkg status peers-ss 2>/dev/null | grep -q "^Status:.*installed"') == 0;
+	let pkg = !from_opkg && system('opkg status peers-ss 2>/dev/null | grep -q "^Status:.*installed"') == 0;
 	system("sed -i '\\#^/etc/config/peers-ss$#d; \\#^/etc/peers-ss/$#d' /etc/sysupgrade.conf");
 	system('rm -rf /etc/peers-ss /tmp/peers-ss /etc/config/peers-ss /etc/rc.d/*peers-ss /tmp/luci-indexcache* /tmp/luci-modulecache');
 	if (pkg) system('opkg remove peers-ss >/dev/null 2>&1');
+	if (from_opkg) { out('Peers-SS left the contour; opkg removes the files.'); return; }
 	system('rm -rf /usr/share/peers-ss /usr/share/rpcd/ucode/peers-ss.uc /usr/share/rpcd/acl.d/luci-app-peers-ss.json /usr/share/luci/menu.d/luci-app-peers-ss.json /www/luci-static/resources/view/peers-ss /etc/init.d/peers-ss');
 	system('/etc/init.d/rpcd reload >/dev/null 2>&1');
 	out('Peers-SS removed. podkop section and its current link were not touched.');
@@ -557,20 +599,21 @@ function cmd_uninstall(args) {
 function cmd_invite(args) {
 	let x = need_engine();
 	if (args[0] == 'create') {
-		let r = INV.create(x, args[1] || null, args[2] || null, +(args[3] ?? 24));
+		let gid = args[1] == 'standalone' ? null : (args[1] || null);
+		let r = INV.create(x, gid, gid ? (args[2] || null) : null, +(args[gid ? 3 : 2] ?? 24));
 		if (r.error) fail(r.error);
-		out('Invite ' + r.id + ' valid until ' + r.expires_at + ':');
+		out('Invite ' + r.id + ' valid until ' + fmt_date(r.expires_at) + ':');
 		out(r.command);
 		return;
 	}
 	if (args[0] == 'revoke') { let r = INV.revoke(x, args[1]); if (r.error) fail(r.error); out('revoked'); return; }
-	for (let i in INV.list(x).invites) out(sprintf('%s %s/%s until %d %s', i.id, i.group ?? 'standalone', i.env ?? 'new',
-		i.expires_at, i.revoked ? 'revoked' : (i.used_by ? 'used by ' + i.used_name : (i.active ? 'active' : 'expired'))));
+	for (let i in INV.list(x).invites) out(sprintf('%s %s/%s until %s %s', i.id, i.group ?? 'standalone', i.env ?? 'new',
+		fmt_date(i.expires_at), i.revoked ? 'revoked' : (i.used_by ? 'used by ' + i.used_name : (i.active ? 'active' : 'expired'))));
 }
 
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  invite create <group> [env] [hours] | revoke <id> | list\n  uninstall [--yes]\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  invite create <group> [env] [hours] | create standalone [hours] | revoke <id> | list\n  uninstall [--yes]\n  version');
 }
 
 let argv = [...ARGV];
@@ -590,6 +633,7 @@ case 'rotate': cmd_rotate(argv); break;
 case 'daemon': cmd_daemon(); break;
 case 'wizard': cmd_wizard(); break;
 case 'uninstall': cmd_uninstall(argv); break;
+case 'passwd-apply': cmd_passwd_apply(); break;
 case 'invite': cmd_invite(argv); break;
 case 'version': out(VERSION); break;
 default: usage(); exit(cmd ? 1 : 0);

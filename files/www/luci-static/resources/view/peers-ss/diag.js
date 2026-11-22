@@ -3,6 +3,8 @@
 'require ui';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 return view.extend({
 	load: function() { return Promise.all([ c.api.events(), c.api.status() ]); },
 	render: function(data) {

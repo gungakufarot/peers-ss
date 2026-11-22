@@ -37,8 +37,22 @@ var STATUS = {
 	no_binding: [ 'Конфиг не назначен', '#6e7781' ], update_required: [ 'Обновите Peers-SS', '#cf222e' ]
 };
 
+// Safe element builder: LuCI dom.append() puts a *string* child into innerHTML; names, statuses, alerts and titles
+// come from other routers / StealthSurf, so strings are always passed as text nodes here.
+var RAW_E = window.E;
+function SE(tag, attrs, children) {
+	if (typeof attrs === 'string' || typeof attrs === 'number' || Array.isArray(attrs) || attrs instanceof Node) { children = attrs; attrs = null; }
+	if (typeof children === 'string' || typeof children === 'number') children = [ String(children) ];
+	return RAW_E(tag, attrs || {}, children);
+}
+function esc(s) {
+	return String(s == null ? '' : s).replace(/[&<>"']/g, function(ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]; });
+}
+
 return baseclass.extend({
 	api: api,
+	E: SE,
+	esc: esc,
 
 	fmtTime: function(ts) {
 		if (!ts) return '—';
@@ -54,12 +68,12 @@ return baseclass.extend({
 		return Math.round(s / 3600) + ' ч назад';
 	},
 	badge: function(status) {
-		var s = STATUS[status] || [ status || '—', '#6e7781' ];
-		return E('span', { 'style': 'display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;background:' + s[1] }, s[0]);
+		var s = STATUS[status] || [ String(status || '—'), '#6e7781' ];
+		return SE('span', { 'style': 'display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;background:' + s[1] }, s[0]);
 	},
 	err: function(res) {
-		if (res && res.conflict) { ui.addNotification(null, E('p', res.message), 'warning'); return true; }
-		if (!res || res.error) { ui.addNotification(null, E('p', 'Ошибка: ' + ((res && res.error) || 'нет ответа')), 'danger'); return true; }
+		if (res && res.conflict) { ui.addNotification(null, SE('p', res.message), 'warning'); return true; }
+		if (!res || res.error) { ui.addNotification(null, SE('p', 'Ошибка: ' + ((res && res.error) || 'нет ответа')), 'danger'); return true; }
 		return false;
 	},
 	// contour edit with conflict detection (rev = revision the page was opened with)
@@ -67,19 +81,22 @@ return baseclass.extend({
 		var self = this;
 		return api.contourOp(op, args || {}, rev).then(function(res) {
 			if (self.err(res)) return null;
-			ui.addNotification(null, E('p', 'Сохранено. Остальные роутеры увидят изменения в течение минуты.'), 'info');
+			ui.addNotification(null, SE('p', 'Сохранено. Остальные роутеры увидят изменения в течение минуты.'), 'info');
 			return res;
 		});
 	},
 	// run a background job and show progress until it finishes (spec §8: long operations run in the service)
 	job: function(name, title) {
 		var self = this;
-		var out = E('pre', { 'style': 'max-height:300px;overflow:auto;white-space:pre-wrap' }, '…');
-		ui.showModal(title, [ E('p', { 'class': 'spinning' }, 'Выполняется, это может занять до нескольких минут…'), out,
-			E('div', { 'class': 'right' }, E('button', { 'class': 'btn', 'click': ui.hideModal }, 'Закрыть')) ]);
+		var out = SE('pre', { 'style': 'max-height:300px;overflow:auto;white-space:pre-wrap' }, '…');
+		var t = null, t0 = Date.now();
+		var close = function() { if (t) window.clearInterval(t); ui.hideModal(); };
+		ui.showModal(esc(title), [ SE('p', { 'class': 'spinning' }, 'Выполняется, это может занять до нескольких минут…'), out,
+			SE('div', { 'class': 'right' }, SE('button', { 'class': 'btn', 'click': close }, 'Закрыть')) ]);
 		return api.jobStart(name).then(function() {
 			return new Promise(function(resolve) {
-				var t = window.setInterval(function() {
+				t = window.setInterval(function() {
+					if (Date.now() - t0 > 15 * 60 * 1000) { window.clearInterval(t); return resolve({ running: false, rc: -1 }); }
 					api.jobStatus(name).then(function(st) {
 						out.textContent = st.output || '…';
 						if (!st.running) {
@@ -99,10 +116,10 @@ return baseclass.extend({
 		return (c && c.title ? c.title + ' ' : '') + '(' + binding + ')';
 	},
 	table: function(head, rows) {
-		return E('table', { 'class': 'table' }, [
-			E('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return E('th', { 'class': 'th' }, h); }))
+		return SE('table', { 'class': 'table' }, [
+			SE('tr', { 'class': 'tr table-titles' }, head.map(function(h) { return SE('th', { 'class': 'th' }, h); }))
 		].concat(rows.map(function(r) {
-			return E('tr', { 'class': 'tr' }, r.map(function(c) { return E('td', { 'class': 'td' }, c); }));
+			return SE('tr', { 'class': 'tr' }, r.map(function(c) { return SE('td', { 'class': 'td' }, c); }));
 		})));
 	}
 });

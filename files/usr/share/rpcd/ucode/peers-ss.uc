@@ -16,7 +16,7 @@ import * as INV from '/usr/share/peers-ss/invite.uc';
 import { request } from '/usr/share/peers-ss/http.uc';
 import { contour_key, fp } from '/usr/share/peers-ss/crypto.uc';
 
-const JOBS = ['check', 'rotate', 'dry', 'diag'];
+const JOBS = ['check', 'rotate', 'dry', 'diag', 'passwd'];
 
 function ctx() {
 	if (!E.init()) return null;
@@ -30,18 +30,27 @@ function job_file(name) { return U.RUN + '/job-' + name + '.json'; }
 
 function job_start(name) {
 	if (index(JOBS, name) < 0) return { error: 'unknown job' };
-	let st = U.readjson(job_file(name));
-	if (st?.running && fs.stat('/proc/' + st.pid)) return { started: false, running: true };
-	let cmd = { check: 'check', rotate: 'rotate', dry: 'rotate --dry-run', diag: 'podkop diag' }[name];
 	U.mkdirp(U.RUN);
+	// one job of a kind at a time: lock dir with the pid of the job shell
+	let lk = U.RUN + '/job-' + name + '.lock';
+	if (!fs.mkdir(lk, 0700)) {
+		let pid = trim(fs.readfile(lk + '/pid') ?? '');
+		let stl = fs.stat(lk);
+		if ((pid && fs.stat('/proc/' + pid)) || (!pid && stl && time() - stl.mtime < 10)) return { started: false, running: true };
+		fs.unlink(lk + '/pid'); fs.rmdir(lk);
+		if (!fs.mkdir(lk, 0700)) return { started: false, running: true };
+	}
+	let cmd = { check: 'check', rotate: 'rotate', dry: 'rotate --dry-run', diag: 'podkop diag', passwd: 'passwd-apply' }[name];
 	U.writejson(job_file(name), { running: true, started: time() });
-	system(sprintf('(sh -c \'echo "{\\"pid\\":$$,\\"running\\":true,\\"started\\":%d}" > %s; /usr/bin/peers-ss %s > %s.out 2>&1; rc=$?; echo "{\\"running\\":false,\\"rc\\":$rc,\\"finished\\":$(date +%%s)}" > %s\') >/dev/null 2>&1 &',
-		time(), job_file(name), cmd, job_file(name), job_file(name)));
+	system(sprintf('(umask 077; sh -c \'echo $$ > %s/pid; /usr/bin/peers-ss %s > %s.out 2>&1; rc=$?; echo "{\\"running\\":false,\\"rc\\":$rc,\\"finished\\":$(date +%%s)}" > %s; rm -f %s/pid; rmdir %s\') >/dev/null 2>&1 &',
+		lk, cmd, job_file(name), job_file(name), lk, lk));
 	return { started: true };
 }
 
 function job_status(name) {
 	let st = U.readjson(job_file(name)) ?? { running: false };
+	let pid = trim(fs.readfile(U.RUN + '/job-' + name + '.lock/pid') ?? '');
+	if (st.running && !(pid && fs.stat('/proc/' + pid)) && time() - (st.started ?? 0) > 15) st.running = false;
 	st.output = U.redact(fs.readfile(job_file(name) + '.out') ?? '');
 	return st;
 }
@@ -92,10 +101,9 @@ function contour_op(op, args, rev) {
 	let w = ST.update(C.p_contour(x.cid), (c) => {
 		if (rev != null && c.rev != rev) { conflict = c.edited_by ? C.router_name(c, c.edited_by) : '?'; return null; }
 		let n = json(sprintf('%J', c));
-		err = OPS.apply(n, op, args ?? {});
+		err = OPS.apply(n, op, args ?? {}, x.rid);
 		if (err) return null;
 		OPS.bump(n, x.rid);
-		rev = n.rev;
 		return n;
 	}, { message: 'contour: ' + op + ' (' + C.router_name(x.contour, x.rid) + ')' });
 	if (conflict) return { conflict: true, by: conflict, message: 'Настройки изменены на ' + conflict + ', обновите страницу' };
@@ -131,7 +139,7 @@ const methods = {
 			for (let b in C.all_bindings(x.contour)) cards[b] = card_view(x, b);
 			let rots = {};
 			for (let b in C.all_bindings(x.contour)) { let r = rotation_view(x, b); if (r) rots[b] = { server_id: r.server_id, location_id: r.location_id, rev: r.rev }; }
-			return { contour: x.contour, me: x.rid, repo: x.repo, routers: routers_view(x), cards, rotations: rots,
+			return { contour: x.contour, me: x.rid, repo: x.repo, podkop_section: PK.section(), routers: routers_view(x), cards, rotations: rots,
 				archive: x.contour.archive ?? [], settings: C.settings(x.contour) };
 		}
 	},
@@ -201,10 +209,11 @@ const methods = {
 				return { ok: true, account: +x.acct, configs: map(API.vless_configs(c.data), (q) => ({ id: q.id, title: q.title, expires_at: q.expires_at,
 					location_id: q.location_id, server_id: q.server_id, binding: x.acct + ':' + q.id })) };
 			}
-			let path = x.cid + '/requests/' + rid + '.json';
+			if (!match(rid, /^r[0-9a-f]+$/) || !x.contour.routers?.[rid]) return { error: 'no such router' };
+			let path = x.cid + '/requests/' + rid + '/' + x.rid + '.json';
 			let r = ST.get(path);
-			if (r.ok && r.obj.answered_at && r.obj.from == x.rid && time() - r.obj.answered_at < 300) return { ok: true, via: rid, account: r.obj.account, configs: r.obj.configs };
-			if (!(r.ok && r.obj.from == x.rid && !r.obj.answered_at && ST.now() - r.obj.at < 120))
+			if (r.ok && r.obj.answered_at && ST.now() - r.obj.answered_at < 300) return { ok: true, via: rid, account: r.obj.account, configs: r.obj.configs };
+			if (!(r.ok && !r.obj.answered_at && ST.now() - r.obj.at < 120))
 				ST.update(path, () => ({ from: x.rid, at: ST.now() }), { message: 'configs request' });
 			return { pending: true, via: rid };
 		}
@@ -237,7 +246,9 @@ const methods = {
 			if (!x) return { error: 'not configured' };
 			if (contour_key(req.args.old ?? '', x.cid) != x.key) return { error: 'current password is wrong' };
 			if (length(req.args.new ?? '') < 8) return { error: 'new password: at least 8 characters' };
-			return INV.change_password(x, req.args.new);
+			// long operation (re-encrypts every file): background job reads the new password from a 0600 file
+			U.writefile(U.RUN + '/passwd.req', req.args.new, 0600);
+			return job_start('passwd');
 		}
 	},
 	invites: { call: function() { let x = ctx(); return x ? INV.list(x) : { error: 'not configured' }; } },

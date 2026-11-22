@@ -3,6 +3,8 @@
 'require ui';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 var EVENTS = [ [ 'rotated', 'Блокировка и успешная ротация' ], [ 'waiting', 'Ротация не помогает, режим ожидания' ], [ 'offline', 'Роутер не на связи больше часа' ],
 	[ 'account', 'Аккаунт пуст / конфиг исчез / токен недействителен / cantChangeSettings' ], [ 'notoken', 'Нет роутера с токеном' ], [ 'badchannel', 'Плохой канал, podkop изменился' ] ];
 

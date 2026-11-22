@@ -3,6 +3,8 @@
 'require ui';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 return view.extend({
 	load: function() { return c.api.contourGet().then(function(d) { return [ d, { repo: d.repo } ]; }); },
 	render: function(data) {
@@ -14,14 +16,14 @@ return view.extend({
 			th = E('input', { 'type': 'number', 'class': 'cbi-input-text', 'value': s.fail_threshold }),
 			rt = E('input', { 'type': 'number', 'class': 'cbi-input-text', 'value': s.retry_min }),
 			ex = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': (s.exclude_locations || []).join(', ') }),
-			ps = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': s.podkop_section });
+			ps = E('code', d.podkop_section || '—');
 		var res = E('div');
 		return E('div', { 'class': 'cbi-map' }, [ E('h2', 'Настройки контура'), E('div', { 'class': 'cbi-section' }, [
 			f('Интервал проверки, с', iv, 'по умолчанию 45'), f('Порог сбоев подряд', th, 'по умолчанию 3'), f('Повтор в режиме ожидания, мин', rt, 'по умолчанию 10'),
-			f('Исключённые локации', ex, 'smart = «Умная», RU = Россия; коды локаций через запятую'), f('Секция podkop', ps),
+			f('Исключённые локации', ex, 'smart = «Умная», RU = Россия; коды локаций через запятую'), f('Секция podkop (этого роутера)', ps, 'задаётся установщиком; у каждого роутера своя'),
 			f('Репозиторий хранилища', E('code', st.repo || '—')),
 			E('div', { 'class': 'right' }, E('button', { 'class': 'btn cbi-button-save', 'click': function() {
-				c.op('settings', { check_interval_s: +iv.value, fail_threshold: +th.value, retry_min: +rt.value, exclude_locations: ex.value, podkop_section: ps.value }, d.contour.rev).then(function(r) { if (r) window.location.reload(); });
+				c.op('settings', { check_interval_s: +iv.value, fail_threshold: +th.value, retry_min: +rt.value, exclude_locations: ex.value }, d.contour.rev).then(function(r) { if (r) window.location.reload(); });
 			} }, 'Сохранить')) ]),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', 'Действия'),
 				E('button', { 'class': 'btn', 'click': function() {
@@ -34,7 +36,7 @@ return view.extend({
 						E('p', { 'class': 'cbi-value-description' }, 'Все файлы контура перешифруются; остальные роутеры получат новый ключ автоматически.'),
 						E('div', { 'class': 'right' }, [ E('button', { 'class': 'btn', 'click': ui.hideModal }, 'Отмена'), ' ', E('button', { 'class': 'btn cbi-button-action', 'click': function() {
 							if (n1.value != n2.value) return alert('Пароли не совпадают');
-							c.api.passwordChange(o.value, n1.value).then(function(r) { if (!c.err(r)) { ui.hideModal(); ui.addNotification(null, E('p', 'Пароль изменён, файлов перешифровано: ' + r.files), 'info'); } });
+							c.api.passwordChange(o.value, n1.value).then(function(r) { if (!c.err(r)) { ui.hideModal(); c.job('passwd', 'Смена пароля контура'); } });
 						} }, 'Сменить') ]) ]);
 				} }, 'Сменить пароль контура'), res ]) ]);
 	},

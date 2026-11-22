@@ -35,7 +35,8 @@ C
 cat > "$OUT/ipk/control/prerm" <<'C'
 #!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
-/etc/init.d/peers-ss stop 2>/dev/null; /etc/init.d/peers-ss disable 2>/dev/null
+[ "$1" = "upgrade" ] && { /etc/init.d/peers-ss stop; exit 0; }
+/usr/bin/peers-ss uninstall --from-opkg </dev/null 2>/dev/null || { /etc/init.d/peers-ss stop; /etc/init.d/peers-ss disable; }
 exit 0
 C
 chmod 755 "$OUT/ipk/control/postinst" "$OUT/ipk/control/prerm"

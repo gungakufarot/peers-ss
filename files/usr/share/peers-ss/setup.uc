@@ -80,6 +80,7 @@ function register_router(cid, key, repo, gh, target, rid) {
 			let g = n.groups?.[target.group_id];
 			if (!g) return null;
 			if (target.env_id && g.envs?.[target.env_id]) env = g.envs[target.env_id];
+			else if (target.env_id) return null;   // environment was deleted/merged after the invite
 			else {
 				let eid = 'e' + (n.next_env_num ?? 2);
 				n.next_env_num = (n.next_env_num ?? 2) + 1;

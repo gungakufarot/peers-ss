@@ -13,6 +13,7 @@ const API = 'https://api.github.com';
 const CACHE = RUN + '/store';
 
 let ctx = { repo: null, token: null, key: null };
+let RING = [];   // previous contour keys (read-only fallback after a password change)
 let clock_ref = null;   // { gh: unix from GitHub Date, mono: monotonic seconds }
 let last_ok = 0;        // monotonic time of last successful GitHub response
 let last_err = null;
@@ -23,6 +24,7 @@ function mono() { let c = clock(true); return c[0] + c[1] / 1e9; }
 
 function init(repo, token, key) { ctx = { repo, token, key }; }
 function set_key(key) { ctx.key = key; }
+function set_keyring(keys) { RING = filter(keys ?? [], (k) => k && k != ctx.key); }
 
 function note_date(res) {
 	let d = parse_http_date(res.headers['date']);
@@ -130,6 +132,7 @@ function unwrap(path, text, key) {
 	try { w = json(text); } catch (e) { return { ok: false, err: 'bad json' }; }
 	if (type(w) != 'object' || type(w.schema) != 'int' || w.schema < 1) return { ok: false, err: 'bad envelope' };
 	let obj = decrypt_json(key ?? ctx.key, w.enc, aad(path, w.schema));
+	if (obj == null && key == null) for (let k in RING) { obj = decrypt_json(k, w.enc, aad(path, w.schema)); if (obj != null) break; }
 	if (obj == null) return { ok: false, bad_key: true, schema_newer: w.schema > SCHEMA, err: 'cannot decrypt (wrong password/key or tampered)' };
 	return { ok: true, obj, schema: w.schema, schema_newer: w.schema > SCHEMA };
 }
@@ -199,4 +202,4 @@ function update(path, fn, opts) {
 	return { ok: false, err: 'too many conflicts', conflicts };
 }
 
-export { get_cached, SCHEMA, init, set_key, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };
+export { get_cached, SCHEMA, init, set_key, set_keyring, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };

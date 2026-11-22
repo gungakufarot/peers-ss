@@ -3,6 +3,8 @@
 'require ui';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 return view.extend({
 	load: function() { return c.api.contourGet(); },
 	reload: function() { window.location.reload(); },
@@ -15,7 +17,7 @@ return view.extend({
 			opts.push(E('option', { 'value': gid + '/' }, g.name + ' / + новая среда'));
 		});
 		var sel = E('select', { 'class': 'cbi-input-select' }, opts);
-		ui.showModal('Перенести «' + r.name + '»', [ sel, E('div', { 'class': 'right' }, [
+		ui.showModal(c.esc('Перенести «' + r.name + '»'), [ sel, E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'btn', 'click': ui.hideModal }, 'Отмена'), ' ',
 			E('button', { 'class': 'btn cbi-button-action', 'click': function() {
 				var p = sel.value.split('/');

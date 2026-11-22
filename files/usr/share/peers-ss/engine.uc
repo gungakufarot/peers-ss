@@ -12,7 +12,7 @@ import * as PK from './podkop.uc';
 import * as H from './health.uc';
 import * as P from './ping.uc';
 import { fp } from './crypto.uc';
-import { try_rekey } from './invite.uc';
+import { try_rekey, switch_key } from './invite.uc';
 
 const VERSION = '0.5.0';
 const STATE = U.RUN + '/state.json';
@@ -44,6 +44,7 @@ function init() {
 	};
 	if (!X.rid || !X.cid || !X.repo || !X.key || !X.gh) return false;
 	ST.init(X.repo, X.gh, X.key);
+	ST.set_keyring(sec.prev_keys ?? []);
 	load_state();
 	START_MONO ??= ST.mono();
 	return true;
@@ -51,15 +52,17 @@ function init() {
 
 function refresh_contour() {
 	let r = ST.get(C.p_contour(X.cid));
-	// contour password changed on another router: follow the rekey chain (spec §8 «Сменить пароль контура»)
-	for (let i = 0; i < 5 && !r.ok && r.bad_key; i++) {
+	// contour password changed on another router: follow the rekey chain (spec §8 «Сменить пароль контура»),
+	// on a key error and every 10 min (files may already be re-encrypted while contour.json is still old)
+	if ((!r.ok && r.bad_key) || ST.mono() - (st.rekey_mono ?? 0) > 600 || ST.mono() < (st.rekey_mono ?? 0)) {
+		st.rekey_mono = ST.mono();
 		let nk = try_rekey(X.cid, X.key);
-		if (!nk) break;
-		U.log('info', 'contour password was changed — switching to the new key');
-		X.key = nk;
-		S.set('contour_key', nk);
-		ST.set_key(nk);
-		r = ST.get(C.p_contour(X.cid));
+		if (nk) {
+			U.log('info', 'contour password was changed — switching to the new key');
+			switch_key(nk, X.key);
+			X.key = nk;
+			r = ST.get(C.p_contour(X.cid));
+		}
 	}
 	let online = r.ok;
 	if (!r.ok && !r.bad_key && !r.rollback) {
@@ -617,15 +620,20 @@ function handle_reports(recs) {
 // ---------- requests from LuCI on other routers: list vless configs through my token ----------
 function serve_requests() {
 	if (!X.token) return;
-	let path = X.cid + '/requests/' + X.rid + '.json';
-	let r = ST.get(path);
-	if (!r.ok || r.obj.answered_at || ST.now() - (r.obj.at ?? 0) > 300) return;
-	let c = API.configs(X.token);
-	if (!c.ok) return;
-	let list = map(API.vless_configs(c.data), (q) => ({ id: q.id, title: q.title, expires_at: q.expires_at, location_id: q.location_id,
-		server_id: q.server_id, binding: X.acct + ':' + q.id }));
-	ST.update(path, (o) => o && !o.answered_at ? { ...o, answered_at: ST.now(), account: +X.acct, configs: list } : null, { message: 'configs answer' });
-	U.log('info', 'answered configs request from ' + C.router_name(X.contour, r.obj.from));
+	let list = null;
+	for (let f in ST.list_dir(X.cid + '/requests/' + X.rid) ?? []) {
+		let path = X.cid + '/requests/' + X.rid + '/' + f.name;
+		let r = ST.get(path);
+		if (!r.ok || r.obj.answered_at || ST.now() - (r.obj.at ?? 0) > 300) continue;
+		if (list == null) {
+			let c = API.configs(X.token);
+			if (!c.ok) return;
+			list = map(API.vless_configs(c.data), (q) => ({ id: q.id, title: q.title, expires_at: q.expires_at, location_id: q.location_id,
+				server_id: q.server_id, binding: X.acct + ':' + q.id }));
+		}
+		ST.update(path, (o) => o && !o.answered_at ? { ...o, answered_at: ST.now(), account: +X.acct, configs: list } : null, { message: 'configs answer' });
+		U.log('info', 'answered configs request from ' + C.router_name(X.contour, r.obj.from));
+	}
 }
 
 // a config assigned in LuCI on any router: the token router of that account creates rotations/<binding>.json

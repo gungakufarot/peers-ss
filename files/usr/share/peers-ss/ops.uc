@@ -4,7 +4,11 @@
 
 import * as C from './contour.uc';
 
-function valid_name(n) { return type(n) == 'string' && length(trim(n)) >= 1 && length(n) <= 32 && trim(n) == n; }
+// characters, not bytes (ucode length() counts bytes; Cyrillic is 2 bytes)
+function nchars(s) { let n = 0; for (let i = 0; i < length(s); i++) if ((ord(s, i) & 0xC0) != 0x80) n++; return n; }
+function valid_name(n) {
+	return type(n) == 'string' && nchars(trim(n)) >= 1 && nchars(n) <= 32 && trim(n) == n && !match(n, /[<>&"[:cntrl:]]/);
+}
 
 function all_names(c) {
 	let n = [];
@@ -19,7 +23,7 @@ function all_names(c) {
 
 // names are unique inside the contour (spec §8), 1-32 chars
 function check_name(c, kind, id, name) {
-	if (!valid_name(name)) return 'name must be 1-32 characters without leading/trailing spaces';
+	if (!valid_name(name)) return 'name must be 1-32 characters, no leading/trailing spaces, no < > & "';
 	for (let x in all_names(c)) if (x[2] == name && !(x[0] == kind && x[1] == id)) return 'name «' + name + '» is already used';
 	return null;
 }
@@ -48,6 +52,15 @@ function free_name(c, base, start) {
 
 function detach_router(c, rid) {
 	C.each_env(c, (eid, e) => { e.routers = filter(e.routers ?? [], (r) => r != rid); });
+}
+
+// standalone environments live only while they have a router; their binding goes to the archive
+function drop_empty_standalone(c) {
+	for (let eid, e in c.standalone ?? {})
+		if (!length(e.routers ?? [])) {
+			if (e.config) c.archive = [...(c.archive ?? []), { at: time(), group: null, env: eid, config: e.config }];
+			delete c.standalone[eid];
+		}
 }
 
 function archive_binding(c, gid, eid, binding, at) {
@@ -135,9 +148,10 @@ function move_router(c, rid, gid, eid, config) {
 	else {
 		let neid = next_id(c, 'e', 'next_env_num');
 		if (gid) env = c.groups[gid].envs[neid] = { name: free_name(c, 'среда', 2), config: config ?? null, routers: [] };
-		else env = (c.standalone ??= {})[neid] = { name: c.routers[rid].name, config: config ?? null, routers: [] };
+		else env = (c.standalone ??= {})[neid] = { name: free_name(c, 'одиночный', 1), config: config ?? null, routers: [] };
 	}
 	env.routers = [...(env.routers ?? []), rid];
+	drop_empty_standalone(c);
 	return null;
 }
 
@@ -153,13 +167,15 @@ function remove_router(c, rid) {
 	if (!c.routers?.[rid]) return 'no such router';
 	detach_router(c, rid);
 	delete c.routers[rid];
+	drop_empty_standalone(c);
 	return null;
 }
 
 // scheme change: merge environments of a group into one; the kept env keeps `keep_config`, others go to archive
 function merge_envs(c, gid, eids, keep_config) {
 	let g = c.groups?.[gid];
-	if (!g || length(eids) < 2) return 'choose at least 2 environments of one group';
+	eids = uniq(eids ?? []);
+	if (!g || length(eids) < 2) return 'choose at least 2 different environments of one group';
 	let target = g.envs[eids[0]];
 	if (!target) return 'no such environment';
 	let at = time();
@@ -179,6 +195,7 @@ function merge_envs(c, gid, eids, keep_config) {
 function split_env(c, gid, eid, rids, config) {
 	let env = find_env(c, gid, eid);
 	if (!env) return 'no such environment';
+	rids = uniq(rids ?? []);
 	if (!length(rids) || length(rids) >= length(env.routers)) return 'choose some (not all) routers to split off';
 	for (let r in rids) if (index(env.routers, r) < 0) return 'router not in this environment';
 	let neid = next_id(c, 'e', 'next_env_num');
@@ -193,7 +210,9 @@ function split_env(c, gid, eid, rids, config) {
 function archive_for(c, gid) { return filter(c.archive ?? [], (a) => a.group == gid); }
 
 // apply named operation with args object (used by rpcd)
-function apply(c, op, a) {
+// a: operation args; me: router id of the caller (it cannot remove itself — use `peers-ss uninstall`)
+function apply(c, op, a, me) {
+	if (op == 'remove_router' && a.rid == me) return 'this router cannot remove itself — run `peers-ss uninstall` on it';
 	switch (op) {
 	case 'rename_router': return rename_router(c, a.rid, a.name);
 	case 'rename_group': return rename_group(c, a.gid, a.name);
@@ -217,7 +236,6 @@ function apply(c, op, a) {
 		}
 		if (s.check_interval_s < 15) return 'check interval must be >= 15 s';
 		if (a.exclude_locations != null) s.exclude_locations = filter(map(split('' + a.exclude_locations, /[ ,]+/), trim), length);
-		if (a.podkop_section != null) { if (!match(a.podkop_section, /^[A-Za-z0-9_]+$/)) return 'bad podkop section'; s.podkop_section = a.podkop_section; }
 		if (a.bot_key != null) { if (a.bot_key != '' && !match(a.bot_key, /^[0-9a-f]{64}$/)) return 'bot key: 64 hex'; s.bot_key = a.bot_key || null; }
 		if (a.bot_events != null) s.bot_events = a.bot_events;
 		c.settings = s;
@@ -227,5 +245,5 @@ function apply(c, op, a) {
 	return 'unknown operation ' + op;
 }
 
-export { valid_name, check_name, bump, find_env, rename_router, rename_group, rename_env, create_group, create_env, delete_env,
+export { nchars, valid_name, check_name, bump, find_env, rename_router, rename_group, rename_env, create_group, create_env, delete_env,
 	delete_group, assign_config, move_router, make_standalone, remove_router, merge_envs, split_env, archive_for, apply };

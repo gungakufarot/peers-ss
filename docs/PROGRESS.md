@@ -3,7 +3,8 @@
 Обновляется после каждого этапа. По этому файлу работу можно продолжить без участия владельца.
 
 ## Где сейчас
-Этапы 0–5 завершены (отчёт stage-5). Текущий: **этап 6** — установщик (`install.sh` + `peers-ss wizard`), токен (set/replace/delete), `config assign`. Сборка архива: `tools/build.sh <tag>`.
+Этапы 0–8 завершены. Текущий: **этап 9** — Telegram-бот (`bot/peers_ss_bot.py`, `bot/pss_crypto.py`) на сервере 169.58.31.113 (`/opt/peers-ss-bot`, служба `peers-ss-bot`).
+Роутеры: r1, r2, r3 (VM), r4 (VM `/root/peers-ss-vm/start4.sh`, ssh `router4`, openwrt-4, ведомый) — все в контуре `c8a9d4463c410`.
 
 Тестовый контур: `c8a9d4463c410` «Тест» в `gungakufarot/peers-ss-state`, группа g1 / среда e1 / Test-conf `91408:344883`.
 Роутеры: r1 `r916f3a17` (openwrt-1, токен), r2 `r2b4ed69e` (openwrt-2, токен, DNS sing-box нестабилен), r3 VM `r98cd07a6` (openwrt-3, ведомый).
@@ -39,6 +40,8 @@
 - Этап 4: podkop apply/diag/latency (отчёт stage-4). На роутере 1 секция `peers_ss` с Test-conf.
 
 - Этап 5: служба, ротация, доставка; все проверки (а)–(д) и «GitHub недоступен» пройдены (отчёт stage-5).
+
+- Этап 6: установщик (stage-6). Этап 7: LuCI (stage-7). Этап 8: приглашения, `--join`, `uninstall` (stage-8).
 
 ## Дальше
 Этапы 0 → 10 по разделу 11 ТЗ.

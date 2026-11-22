@@ -3,6 +3,8 @@
 'require ui';
 'require view.peers-ss.common as c';
 
+var E = c.E;
+
 return view.extend({
 	load: function() { return c.api.contourGet(); },
 
@@ -35,7 +37,7 @@ return view.extend({
 
 	showMembers: function(d, e, rts) {
 		var card = d.cards[e.config] || {}, rot = d.rotations[e.config] || {};
-		ui.showModal('Состав: ' + e.name, [
+		ui.showModal(c.esc('Состав: ' + e.name), [
 			E('p', 'Роутеров: ' + rts.length),
 			c.table([ 'Роутер', 'Статус', 'Последний контакт' ], rts.map(function(r) { return [ r.name, c.badge(r.status), c.ago(r.last_contact) ]; })),
 			E('p', [ E('strong', 'Конфиг: '), c.bindingTitle(e.config, d.cards) ]),
@@ -106,9 +108,10 @@ return view.extend({
 				});
 			};
 			src.addEventListener('change', fill); fill();
+			var known = Object.keys(d.cards || {}).filter(function(b) { return !arch.some(function(a) { return a.config == b; }); });
 			var cfg = E('select', { 'class': 'cbi-input-select' }, [ E('option', { 'value': '' }, 'назначить позже') ].concat(arch.map(function(a) {
 				return E('option', { 'value': a.config }, 'из архива: ' + c.bindingTitle(a.config, d.cards) + ' (' + c.fmtDate(a.at) + ')');
-			})));
+			})).concat(known.map(function(b) { return E('option', { 'value': b }, 'конфиг: ' + c.bindingTitle(b, d.cards)); })));
 			ui.showModal('Разделить среду — шаг 2 из 3', [ E('p', 'Из какой среды:'), src, E('p', 'Какие роутеры перенести в новую среду:'), box,
 				E('p', 'Конфиг новой среды' + (arch.length ? ' (можно восстановить из архива):' : ':')), cfg,
 				E('div', { 'class': 'right' }, [ E('button', { 'class': 'btn', 'click': ui.hideModal }, 'Отмена'), ' ',
