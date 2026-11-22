@@ -5,8 +5,8 @@ set -e
 TAG=${1:?usage: build.sh <tag>}
 VER=${TAG#v}
 cd "$(dirname "$0")/.."
-OUT=dist; rm -rf "$OUT"; mkdir -p "$OUT/tree"
-cp -a files/. "$OUT/tree/"
+OUT=dist; rm -rf "$OUT"; mkdir -p "$OUT"
+tools/stage-tree.sh "$OUT/tree" "$TAG" >/dev/null
 sed -i "s/^const VERSION = '[^']*';/const VERSION = '$VER';/" "$OUT/tree/usr/share/peers-ss/engine.uc"
 python3 tools/minify.py "$OUT/tree"
 chmod 755 "$OUT/tree/usr/bin/peers-ss" "$OUT/tree/etc/init.d/peers-ss"

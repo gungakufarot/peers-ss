@@ -1,16 +1,14 @@
 'use strict';
-'require view';
+'require baseclass';
 'require ui';
-'require poll';
-'require view.peers-ss.common as c';
+'require view.peers-ss.__V__.common as c';
 
 var E = c.E;
 
 var EVENTS = [ [ 'rotated', 'Блокировка и ротация' ], [ 'waiting', 'Ротация не помогает' ], [ 'offline', 'Роутер не на связи > 1 ч' ],
 	[ 'account', 'Проблемы токена / конфига' ], [ 'notoken', 'Нет роутера с токеном' ], [ 'badchannel', 'Плохой канал, podkop изменился' ] ];
 
-return view.extend({
-	load: function() { c.css(); return c.api.ui(); },
+return baseclass.extend({
 
 	hero: function(u) {
 		var st = u.state || {}, rot = (u.rotations || {})[u.binding] || {}, card = (u.cards || {})[u.binding] || {};
@@ -28,7 +26,7 @@ return view.extend({
 					E('div', { 'class': 'muted' }, (me.name || u.rid) + ' · ' + (g ? g.name + ' / ' : '') + envName + ' · контур «' + (u.contour.name || u.cid) + '»')
 				]),
 				E('div', { 'class': 'row' }, [
-					c.btn('Проверить сейчас', function() { c.job('check', 'Проверка', function() { c.api.ui().then(function(n) { if (n.configured && !document.querySelector('details[open]')) location.reload(); }); }); }, 'cbi-button-action'),
+					c.btn('Проверить сейчас', function() { c.job('check', 'Проверка', function() { c.api.ui().then(function(n) { if (n.configured && !document.querySelector('details[open]')) c.app.reload(); }); }); }, 'cbi-button-action'),
 					u.has_token && u.binding ? c.btn('Сменить сервер', function() {
 						if (confirm('Перенести конфиг на другой сервер сейчас? Это касается ВСЕХ роутеров с этим конфигом.')) c.job('rotate', 'Смена сервера');
 					}, 'cbi-button-negative') : ''
@@ -126,24 +124,20 @@ return view.extend({
 
 	render: function(u) {
 		var self = this, root = E('div', { 'class': 'pss' });
-		var draw = function(d) {
+		self.root = root;
+		self.draw = function(d) {
 			root.innerHTML = '';
 			if (!d.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, d.pending ? 'Данные загружаются из хранилища — обновите страницу через минуту.' : 'Роутер не зарегистрирован в контуре. Запустите install.sh.')); return; }
-			var redraw = function() { c.api.ui().then(draw); };
-			[ E('h2', 'Peers-SS') ].concat(self.banners(d), [ self.hero(d), self.contourCard(d), self.alertsCard(d),
+			var redraw = function() { c.app.reload(); };
+			self.banners(d).concat([ self.hero(d), self.contourCard(d), self.alertsCard(d),
 				self.settingsCard(d, redraw), self.notifyCard(d, redraw), self.securityCard(d), c.footer(d, function() { c.refresh(redraw); }) ])
 				.forEach(function(n) { root.appendChild(n); });
 		};
-		draw(u);
-		// light refresh of the status block only (details/inputs stay as the user left them)
-		poll.add(function() {
-			return c.api.ui().then(function(n) {
-				if (!n.configured) return;
-				var hero = root.querySelector('.card');
-				if (hero && !root.querySelector('details[open]') && !c.modalOpen()) draw(n);
-			});
-		}, 20);
+		self.draw(u);
 		return root;
 	},
-	handleSaveApply: null, handleSave: null, handleReset: null
+	// periodic refresh from the app: keep open sections / dialogs as the user left them
+	refresh: function(n) {
+		if (n.configured && !this.root.querySelector('details[open]') && !c.modalOpen()) this.draw(n);
+	},
 });

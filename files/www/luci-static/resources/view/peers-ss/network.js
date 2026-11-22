@@ -1,8 +1,7 @@
 'use strict';
-'require view';
+'require baseclass';
 'require ui';
-'require poll';
-'require view.peers-ss.common as c';
+'require view.peers-ss.__V__.common as c';
 
 var E = c.E;
 
@@ -15,8 +14,7 @@ function envOf(ct, rid) {
 	return res;
 }
 
-return view.extend({
-	load: function() { c.css(); return c.api.ui(); },
+return baseclass.extend({
 
 	// ---------- helpers ----------
 	rec: function(rid) { return (this.u.routers || []).filter(function(r) { return r.rid == rid; })[0] || { rid: rid }; },
@@ -287,17 +285,15 @@ return view.extend({
 		var self = this;
 		self.u = u; self.root = E('div', { 'class': 'pss' });
 		self.draw();
-		// statuses refresh; the layout is redrawn only when the contour changed elsewhere and no dialog is open
-		poll.add(function() {
-			return c.api.ui().then(function(n) {
-				if (!n.configured || self.dragging || c.modalOpen()) return;
-				var changed = n.contour.rev > self.u.contour.rev;
-				self.u.routers = n.routers; self.u.rotations = n.rotations; self.u.invites = n.invites; self.u.age = n.age;
-				if (changed) self.u.contour = n.contour;
-				self.draw();
-			});
-		}, 20);
 		return self.root;
 	},
-	handleSaveApply: null, handleSave: null, handleReset: null
+	// statuses refresh; the layout follows only newer contour revisions; nothing while dragging or in a dialog
+	refresh: function(n) {
+		var self = this;
+		if (!n.configured || self.dragging || c.modalOpen()) return;
+		var changed = n.contour.rev > self.u.contour.rev;
+		self.u.routers = n.routers; self.u.rotations = n.rotations; self.u.invites = n.invites; self.u.age = n.age;
+		if (changed) self.u.contour = n.contour;
+		self.draw();
+	},
 });

@@ -96,6 +96,7 @@ function esc(s) {
 }
 
 return baseclass.extend({
+	app: null,   // set by the page (main.js): { reload() }
 	api: api,
 	E: SE,
 	esc: esc,

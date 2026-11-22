@@ -83,7 +83,7 @@ tar -xzf "$TMPD/p.tgz" -C "$TMPD/root" || die "bad archive"
 KEEP_CFG=""
 [ -f /etc/config/peers-ss ] && KEEP_CFG=1
 # previous version's code is replaced as a whole
-rm -rf /usr/share/peers-ss
+rm -rf /usr/share/peers-ss /www/luci-static/resources/view/peers-ss
 ( cd "$TMPD/root" && find . -type f ! -path ./etc/config/peers-ss ) > "$TMPD/list"
 while read -r f; do
 	mkdir -p "/$(dirname "$f")" && cp "$TMPD/root/$f" "/$f" || die "copying $f failed (flash full?) — run the installer again"

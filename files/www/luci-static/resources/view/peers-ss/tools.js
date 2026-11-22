@@ -1,12 +1,11 @@
 'use strict';
-'require view';
+'require baseclass';
 'require ui';
-'require view.peers-ss.common as c';
+'require view.peers-ss.__V__.common as c';
 
 var E = c.E;
 
-return view.extend({
-	load: function() { c.css(); return Promise.all([ c.api.ui(), c.api.events() ]); },
+return baseclass.extend({
 
 	tokenCard: function(u) {
 		var self = this, shown = false;
@@ -33,7 +32,7 @@ return view.extend({
 					check(inp.value.trim(), box).then(function(r) {
 						if (!r.ok) return;
 						if (r.follower_bindings.length && !confirm('Роутер станет ведомым для части конфигов. Сохранить?')) return;
-						c.api.tokenSet(inp.value.trim(), lbl.value).then(function(x) { if (!c.err(x)) { ui.hideModal(); c.notify('Токен сохранён'); window.location.reload(); } });
+						c.api.tokenSet(inp.value.trim(), lbl.value).then(function(x) { if (!c.err(x)) { ui.hideModal(); c.notify('Токен сохранён'); c.app.reload(); } });
 					});
 				}, 'cbi-button-save') ]);
 		};
@@ -46,7 +45,7 @@ return view.extend({
 			E('div', { 'class': 'right' }, [
 				u.has_token ? c.btn('Проверить', function() { check('', info); }) : '', ' ',
 				c.btn(u.has_token ? 'Заменить' : 'Добавить токен', replace, 'cbi-button-action'), ' ',
-				u.has_token ? c.btn('Удалить', function() { if (confirm('Удалить токен? Роутер станет ведомым по всем привязкам.')) c.api.tokenDelete().then(function() { window.location.reload(); }); }, 'cbi-button-negative') : ''
+				u.has_token ? c.btn('Удалить', function() { if (confirm('Удалить токен? Роутер станет ведомым по всем привязкам.')) c.api.tokenDelete().then(function() { c.app.reload(); }); }, 'cbi-button-negative') : ''
 			]) ]);
 	},
 
@@ -96,13 +95,14 @@ return view.extend({
 		return E('div', { 'class': 'card' }, [ E('h3', [ '📜 Журнал событий', E('span', { 'class': 'sp' }), filt, E('label', { 'class': 'muted' }, [ onlyWarn, ' только ошибки' ]) ]), pre ]);
 	},
 
-	render: function(data) {
-		var u = data[0], ev = data[1] || {};
-		var root = E('div', { 'class': 'pss' });
+	render: function(u) {
+		var root = E('div', { 'class': 'pss' }), logBox = E('div', { 'class': 'card' }, [ E('h3', '📜 Журнал событий'), E('p', { 'class': 'spinning' }, 'загрузка…') ]);
 		if (!u.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, 'Роутер не зарегистрирован в контуре.')); return root; }
-		[ E('h2', 'Токен и диагностика'), c.staleBanner(u) || '', this.tokenCard(u), this.diagCard(u), this.historyCard(u), this.logCard(ev),
-			c.footer(u, function() { c.refresh(function() { window.location.reload(); }); }) ].forEach(function(n) { if (n) root.appendChild(n); });
+		[ c.staleBanner(u), this.tokenCard(u), this.diagCard(u), this.historyCard(u), logBox,
+			c.footer(u, function() { c.refresh(function() { c.app.reload(); }); }) ].forEach(function(n) { if (n) root.appendChild(n); });
+		var self = this;
+		c.api.events().then(function(ev) { var n = self.logCard(ev || {}); logBox.replaceWith(n); });   // journal loads after the page is shown
 		return root;
 	},
-	handleSaveApply: null, handleSave: null, handleReset: null
+	refresh: function(n) {},
 });

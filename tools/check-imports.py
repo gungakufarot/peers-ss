@@ -9,7 +9,7 @@ for f in [t for t in tracked if t.startswith('files/') and (t.endswith('.uc') or
         p = m.group(1)
         path = 'files' + p if p.startswith('/') else os.path.normpath(os.path.join(os.path.dirname(f), p))
         if path not in tracked: print(f'{f}: import {p} -> {path} NOT TRACKED'); bad = 1
-    for m in re.finditer(r"'require view\.peers-ss\.(\w+)", s):
+    for m in re.finditer(r"'require view\.peers-ss\.(?:__V__\.)?(\w+)", s):
         path = 'files/www/luci-static/resources/view/peers-ss/%s.js' % m.group(1)
         if path not in tracked: print(f'{f}: require {m.group(1)} NOT TRACKED'); bad = 1
 sys.exit(bad)
