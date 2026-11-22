@@ -4,7 +4,7 @@
 import * as fs from 'fs';
 import { cursor } from 'uci';
 import * as U from './util.uc';
-import * as S from './secrets.uc';
+import * as S from './keystore.uc';
 import * as ST from './store.uc';
 import * as C from './contour.uc';
 import * as API from './api.uc';

@@ -2,7 +2,7 @@
 'use strict';
 
 import * as U from './util.uc';
-import * as S from './secrets.uc';
+import * as S from './keystore.uc';
 import * as ST from './store.uc';
 import * as C from './contour.uc';
 import { contour_key, sha256_hex, encrypt_json, decrypt_json, fp } from './crypto.uc';

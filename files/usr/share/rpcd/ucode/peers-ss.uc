@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import { cursor } from 'uci';
 import * as U from '/usr/share/peers-ss/util.uc';
-import * as S from '/usr/share/peers-ss/secrets.uc';
+import * as S from '/usr/share/peers-ss/keystore.uc';
 import * as ST from '/usr/share/peers-ss/store.uc';
 import * as C from '/usr/share/peers-ss/contour.uc';
 import * as API from '/usr/share/peers-ss/api.uc';

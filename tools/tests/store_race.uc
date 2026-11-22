@@ -1,6 +1,6 @@
 // usage: ucode store_race.uc <who> <n> ; appends n entries "<who>-i" to test-stage3/race.json
 'use strict';
-import * as S from '/usr/share/peers-ss/secrets.uc';
+import * as S from '/usr/share/peers-ss/keystore.uc';
 import * as ST from '/usr/share/peers-ss/store.uc';
 import { kdf } from '/usr/share/peers-ss/crypto.uc';
 let who = ARGV[0], n = +ARGV[1], file = ARGV[2] ?? 'test-stage3/race.json';
