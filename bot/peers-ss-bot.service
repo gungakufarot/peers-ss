@@ -1,0 +1,25 @@
+[Unit]
+Description=Peers-SS Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/peers-ss-bot/env
+WorkingDirectory=/opt/peers-ss-bot
+ExecStart=/usr/bin/python3 -I /opt/peers-ss-bot/peers_ss_bot.py
+Restart=always
+RestartSec=10
+# hardening: the bot writes only its own folder
+ProtectSystem=strict
+ReadWritePaths=/opt/peers-ss-bot
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -18,9 +18,15 @@ REPO = ENV.get('STATE_REPO', '')
 DB_PATH = ENV.get('DB_PATH', '/opt/peers-ss-bot/bot.db')
 REMIND_AT = ENV.get('REMIND_AT', '21:00')           # HH:MM Moscow time
 STORE_POLL_S = int(ENV.get('STORE_POLL_S', '300'))  # spec: every 5 minutes
-CARD_STALE_S = 24 * 3600
+CARD_STALE_S = int(ENV.get('CARD_STALE_S', str(24 * 3600)))  # test override only
 
 log = logging.getLogger('peers-ss-bot')
+
+# IPv6 to Telegram hangs on some servers (seen on the admin server): resolve IPv4 only unless BOT_IPV6=1
+if ENV.get('BOT_IPV6') != '1':
+    import socket
+    _gai = socket.getaddrinfo
+    socket.getaddrinfo = lambda host, port, family=0, *a, **k: _gai(host, port, socket.AF_INET, *a, **k)
 
 # ---------------- helpers ----------------
 def now_msk(): return dt.datetime.now(MSK)
@@ -272,9 +278,12 @@ class Bot:
         user = m.get('from', {})
         if self.is_admin(chat) and text in ('/start', '/admin'):
             return self.tg.send(chat, 'Админка Peers-SS', self.admin_menu())
+        if text == '/join':   # register as a client (also lets the admin test the client flow with the same account)
+            text = '/start'
+            self.db.q('DELETE FROM clients WHERE chat_id=? AND status NOT IN (?)', (chat, 'active'))
         row = self.db.q('SELECT status FROM clients WHERE chat_id=?', (chat,))
         status = row[0][0] if row else None
-        if text == '/start' or status is None:
+        if text == '/start' or status is None or (self.is_admin(chat) and status == 'awaiting_nick' and text.startswith('/')):
             if status == 'active': return self.tg.send(chat, self.client_configs_text(chat))
             self.db.q('INSERT OR REPLACE INTO clients (chat_id, username, first_name, nick, status, created_at) VALUES (?,?,?,?,?,?)',
                       (chat, user.get('username'), user.get('first_name'), None, 'awaiting_nick', int(time.time())))
@@ -381,6 +390,7 @@ class Bot:
             if ups is None: time.sleep(5); continue
             for u in ups:
                 off = u['update_id'] + 1
+                log.info('update %s: %s', u['update_id'], 'callback' if 'callback_query' in u else 'message')
                 self.db.set('update_offset', off)
                 try:
                     if 'message' in u: self.on_message(u['message'])
