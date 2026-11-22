@@ -67,6 +67,13 @@ function create_section(name, c) {
 // lists match, podkop nft.sh mangle_output) — regardless of enable_output_network_interface (that one only binds
 // sing-box's direct outbound to an interface). So API/GitHub hosts must be in an exclusion section (spec §6).
 const DIRECT_HOSTS = ['api.stealthsurf.net', 'api.github.com', 'github.com', 'objects.githubusercontent.com', 'raw.githubusercontent.com'];
+// v1.0.0-1.0.1 created this exclusion section; it made API access depend on sing-box DNS — removed again
+function drop_exclusion(c) {
+	if (c.get('podkop', 'peers_ss_direct') == null) return false;
+	c.delete('podkop', 'peers_ss_direct');
+	return true;
+}
+
 function ensure_exclusion(c) {
 	if (c.get('podkop', 'peers_ss_direct') != null) return false;
 	c.set('podkop', 'peers_ss_direct', 'section');
@@ -233,7 +240,7 @@ function apply_link(link, opts) {
 	if (c.get('podkop', name) != null && !section_ok(name))
 		return { changed: false, ok: false, err: 'podkop section is not a url proxy section: ' + name, podkop_changed: true };
 	let cur = c.get('podkop', name, 'proxy_string');
-	if (cur == link && !opts.force && c.get('podkop', 'peers_ss_direct') != null) return { changed: false, ok: true };
+	if (cur == link && !opts.force) return { changed: false, ok: true };
 	if (!lock()) return { changed: false, ok: false, err: 'podkop is locked by another apply' };
 	backup_orig();
 	mkdirp(RUN);
@@ -242,7 +249,7 @@ function apply_link(link, opts) {
 	c.revert('podkop');
 	create_section(name, c);
 	ensure_mixed(name, c);
-	ensure_exclusion(c);
+	drop_exclusion(c);
 	c.set('podkop', name, 'proxy_config_type', 'url');
 	c.set('podkop', name, 'proxy_string', link);
 	c.commit('podkop');

@@ -7,6 +7,7 @@ import { RUN, q, mkdirp, sh, uniq_name } from './util.uc';
 // Fallback resolver: the router's own DNS goes through podkop's sing-box; if that is down or flaky
 // (curl exit 6) we resolve API/GitHub hosts directly via public resolvers and retry with --resolve.
 const FALLBACK_DNS = ['1.1.1.1', '8.8.8.8', '9.9.9.9', '77.88.8.8'];
+const DIRECT = { 'api.stealthsurf.net': true, 'api.github.com': true, 'github.com': true, 'raw.githubusercontent.com': true, 'objects.githubusercontent.com': true };
 
 function resolve_direct(host) {
 	let cf = RUN + '/dns-' + replace(host, /[^a-z0-9.-]/g, '_');
@@ -40,6 +41,13 @@ function request(url, opts) {
 		cmd += ' --data-binary @' + q(inp);
 	}
 	if (opts.proxy) cmd += ' -x ' + q(opts.proxy);
+	// API/GitHub must not depend on podkop: their domains may be in a client's lists (fake-IP -> tunnel) and the
+	// router's DNS goes through sing-box. Resolve them via public resolvers and connect to the real IP (spec §6).
+	let hm = match(url, /^https:\/\/([^\/:]+)(:([0-9]+))?/);
+	if (hm && !opts.proxy && DIRECT[hm[1]]) {
+		let ip = resolve_direct(hm[1]);
+		if (ip) cmd += ' --resolve ' + q(hm[1] + ':' + (hm[3] ?? '443') + ':' + ip);
+	}
 	let r = sh(cmd + ' ' + q(url));
 	if (r.code == 6 && !opts.proxy) {
 		let m = match(url, /^https:\/\/([^\/:]+)(:([0-9]+))?/);
