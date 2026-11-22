@@ -1,0 +1,21 @@
+name: release
+on:
+  push:
+    tags: [ 'v*' ]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard — no test-only settings in the release
+        run: |
+          ! grep -R "test_patch_allow" files/etc/config/ || { echo "test_patch_allow must not be in the release config"; exit 1; }
+      - name: Build tar.gz + ipk + SHA256SUMS
+        run: tools/build.sh "${GITHUB_REF_NAME}"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "Peers-SS ${GITHUB_REF_NAME}" --notes "Install: wget -qO- https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh"
