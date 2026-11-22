@@ -425,6 +425,7 @@ function resume_wizard() {
 
 // ---- join wizard (spec §4, mode B) ----
 function cmd_join_wizard(code) {
+	if (uci_get('contour_id') && uci_get('setup_done') != '1' && PK.current_link()) uci_set('setup_done', '1');
 	if (uci_get('contour_id') && uci_get('setup_done') != '1') return resume_wizard();
 	if (uci_get('contour_id')) fail(sprintf('this router is already in contour %s — run `peers-ss uninstall` first', uci_get('contour_id')));
 	let inv = INV.decode(code);
@@ -478,6 +479,8 @@ function cmd_join_wizard(code) {
 function cmd_wizard() {
 	let join = getenv('PEERS_SS_JOIN');
 	if (join) return cmd_join_wizard(join);
+	// installs made before the setup_done flag existed: a router with an applied link is fully set up
+	if (uci_get('contour_id') && uci_get('setup_done') != '1' && PK.current_link()) uci_set('setup_done', '1');
 	if (uci_get('contour_id') && uci_get('setup_done') != '1') return resume_wizard();
 	if (uci_get('contour_id')) {
 		out(sprintf('This router is already in contour %s (%s). Settings kept; service restarted.', uci_get('contour_id'), uci_get('router_id')));

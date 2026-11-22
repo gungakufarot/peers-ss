@@ -14,7 +14,7 @@ import * as P from './ping.uc';
 import { fp } from './crypto.uc';
 import { try_rekey, switch_key } from './invite.uc';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const STATE = U.RUN + '/state.json';
 const LOCK_TTL = 180;
 const ROT_HISTORY = 10;
