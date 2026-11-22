@@ -1,7 +1,7 @@
 {
 	"luci-app-peers-ss": {
 		"description": "Peers-SS (administrator only)",
-		"read": { "ubus": { "luci.peers-ss": [ "status", "contour_get", "job_status", "invites", "events", "report" ] } },
+		"read": { "ubus": { "luci.peers-ss": [ "ui", "status", "contour_get", "job_status", "invites", "events", "report" ] } },
 		"write": { "ubus": { "luci.peers-ss": [ "token_get", "configs", "contour_op", "token_check", "token_set", "token_delete", "job_start", "test_alert", "api_check", "password_change", "invite_create", "invite_revoke" ] } }
 	}
 }

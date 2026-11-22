@@ -167,6 +167,23 @@ function get_cached(path, key) {
 	return u;
 }
 
+// all objects of a directory: one listing request (ETag) + only files whose git sha changed.
+// Decrypted objects are cached in RAM per sha (long-lived daemon / rpcd). Returns { name: obj } or null.
+let DIRCACHE = {};
+function read_dir(dir, key) {
+	let list = list_dir(dir);
+	if (list == null) return null;
+	let out = {};
+	for (let f in list) {
+		let p = dir + '/' + f.name, c = DIRCACHE[p];
+		if (c && c.sha == f.sha) { if (c.obj != null) out[f.name] = c.obj; continue; }
+		let r = get(p, key);
+		DIRCACHE[p] = { sha: f.sha, obj: r.ok ? r.obj : null };
+		if (r.ok) out[f.name] = r.obj;
+	}
+	return out;
+}
+
 function put(path, obj, sha, message, key) {
 	let text = wrap(path, obj, key);
 	let w = put_raw(path, text, sha, message);
@@ -202,4 +219,4 @@ function update(path, fn, opts) {
 	return { ok: false, err: 'too many conflicts', conflicts };
 }
 
-export { get_cached, SCHEMA, init, set_key, set_keyring, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };
+export { read_dir, get_cached, SCHEMA, init, set_key, set_keyring, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };

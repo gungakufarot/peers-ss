@@ -16,7 +16,7 @@ import * as INV from '/usr/share/peers-ss/invite.uc';
 import { request } from '/usr/share/peers-ss/http.uc';
 import { contour_key, fp } from '/usr/share/peers-ss/crypto.uc';
 
-const JOBS = ['check', 'rotate', 'dry', 'diag', 'passwd'];
+const JOBS = ['check', 'rotate', 'dry', 'diag', 'passwd', 'snapshot'];
 
 function ctx() {
 	if (!E.init()) return null;
@@ -40,7 +40,7 @@ function job_start(name) {
 		fs.unlink(lk + '/pid'); fs.rmdir(lk);
 		if (!fs.mkdir(lk, 0700)) return { started: false, running: true };
 	}
-	let cmd = { check: 'check', rotate: 'rotate', dry: 'rotate --dry-run', diag: 'podkop diag', passwd: 'passwd-apply' }[name];
+	let cmd = { check: 'check', rotate: 'rotate', dry: 'rotate --dry-run', diag: 'podkop diag', passwd: 'passwd-apply', snapshot: 'snapshot' }[name];
 	U.writejson(job_file(name), { running: true, started: time() });
 	system(sprintf('(umask 077; sh -c \'echo $$ > %s/pid; /usr/bin/peers-ss %s > %s.out 2>&1; rc=$?; echo "{\\"running\\":false,\\"rc\\":$rc,\\"finished\\":$(date +%%s)}" > %s; rm -f %s/pid; rmdir %s\') >/dev/null 2>&1 &',
 		lk, cmd, job_file(name), job_file(name), lk, lk));
@@ -94,6 +94,14 @@ function alerts_view(x) {
 }
 
 // save a contour edit with CAS; rev = contour rev the page was opened with (spec §8 concurrent edits)
+// keep the UI snapshot in step with edits made from this page (the daemon refreshes it every tick anyway)
+function ui_patch(fn) {
+	let u = U.readjson(E.UI_FILE);
+	if (!u) return;
+	fn(u);
+	U.writejson(E.UI_FILE, u);
+}
+
 function contour_op(op, args, rev) {
 	let x = ctx();
 	if (!x) return { error: 'not configured' };
@@ -110,10 +118,31 @@ function contour_op(op, args, rev) {
 	if (err) return { error: err };
 	if (!w.ok) return { error: w.err ?? 'GitHub write failed' };
 	U.log('info', 'LuCI: contour ' + op);
-	return { ok: true, rev: w.obj.rev };
+	ui_patch((u) => { u.contour = w.obj; u.settings = C.settings(w.obj); });
+	return { ok: true, rev: w.obj.rev, contour: w.obj };
 }
 
 const methods = {
+	// everything the three tabs need, from the RAM snapshot written by the service (instant)
+	ui: {
+		call: function() {
+			let u = U.readjson(E.UI_FILE);
+			if (!u) {
+				let x = ctx();
+				if (!x) return { configured: false, version: E.VERSION, podkop: PK.check_podkop() };
+				E.load_state();
+				E.recs_refresh(true);
+				u = E.write_ui(true);
+			}
+			u.configured = true;
+			u.age = time() - (u.at ?? 0);
+			let t = S.get('ss_token');
+			u.token_masked = t ? mask(t) : null;
+			u.jobs = {};
+			for (let j in JOBS) { let s = U.readjson(job_file(j)); if (s?.running) u.jobs[j] = true; }
+			return u;
+		}
+	},
 	status: {
 		call: function() {
 			let x = ctx();
@@ -254,11 +283,23 @@ const methods = {
 	invites: { call: function() { let x = ctx(); return x ? INV.list(x) : { error: 'not configured' }; } },
 	invite_create: {
 		args: { group: '', env: '', hours: 24 },
-		call: function(req) { let x = ctx(); return x ? INV.create(x, req.args.group || null, req.args.env || null, +(req.args.hours || 24)) : { error: 'not configured' }; }
+		call: function(req) {
+			let x = ctx();
+			if (!x) return { error: 'not configured' };
+			let r = INV.create(x, req.args.group || null, req.args.env || null, +(req.args.hours || 24));
+			if (r.ok) ui_patch((u) => { u.invites = [{ id: r.id, group: req.args.group || null, env: req.args.env || null, created_at: time(), expires_at: r.expires_at, active: true }, ...(u.invites ?? [])]; });
+			return r;
+		}
 	},
 	invite_revoke: {
 		args: { id: '' },
-		call: function(req) { let x = ctx(); return x ? INV.revoke(x, req.args.id) : { error: 'not configured' }; }
+		call: function(req) {
+			let x = ctx();
+			if (!x) return { error: 'not configured' };
+			let r = INV.revoke(x, req.args.id);
+			if (r.ok) ui_patch((u) => { for (let i in u.invites ?? []) if (i.id == req.args.id) { i.revoked = true; i.active = false; } });
+			return r;
+		}
 	},
 	events: {
 		call: function() { return { log: U.redact(fs.readfile(U.RUN + '/events.log') ?? '') }; }

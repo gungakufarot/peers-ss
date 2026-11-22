@@ -125,12 +125,10 @@ function heartbeat(force) {
 }
 
 // all routers files (ETag-cached); returns { rid: record }
+// routers/*.json in one listing (+ only changed files)
 function read_routers() {
-	let out = {};
-	for (let rid in keys(X.contour?.routers ?? {})) {
-		let r = ST.get(C.p_router(X.cid, rid));
-		if (r.ok) out[rid] = r.obj;
-	}
+	let d = ST.read_dir(X.cid + '/routers') ?? {}, out = {};
+	for (let rid in keys(X.contour?.routers ?? {})) if (d[rid + '.json']) out[rid] = d[rid + '.json'];
 	return out;
 }
 
@@ -460,6 +458,7 @@ function rotate_inner(opts) {
 		let w = opts.nolock ? { ok: false } : write_rotation(binding, (n) => {
 			n.rev = (n.rev ?? 0) + 1; n.url = new_url; n.server_id = new_sid; n.location_id = loc.id;
 			n.history = slice([...(n.history ?? []), hist], -ROT_HISTORY);
+			n.location_title = loc.title;
 			n.blacklist = { ...blacklisted(n, ST.now()), ['' + old_server]: ST.now() + BLACKLIST_S };
 			n.lock = { by: X.rid, until: ST.now() + LOCK_TTL };
 			n.reports = {};
@@ -691,12 +690,24 @@ function reconcile(recs, every_s) {
 		}, 'rotation: reconcile with API');
 		if (w.ok) { apply_link(fc.cfg.connection_url, 'reconcile'); st.applied_rev = w.obj.rev; }
 	}
+	// config facts for LuCI (no secrets): title, expiry, auto-renewal, location
+	if (r.ok) {
+		let o = r.obj, lt = null;
+		for (let l in o.loc_snapshot ?? []) if (l.id == fc.cfg.location_id) lt = l.title ?? l.code;
+		if (!lt || lt == fc.cfg.location_id || !o.loc_snapshot?.[0]?.title) {
+			// titles are not in an old snapshot yet: one GET /locations
+			let lr = API.locations(X.token);
+			if (lr.ok) for (let l in lr.data) if (l.id == fc.cfg.location_id) lt = l.title;
+		}
+		if (o.title != fc.cfg.title || o.expires_at != fc.cfg.expires_at || o.auto_renewal != fc.cfg.auto_renewal || (lt && o.location_title != lt))
+			write_rotation(X.binding, (n) => { n.title = fc.cfg.title; n.expires_at = fc.cfg.expires_at; n.auto_renewal = fc.cfg.auto_renewal; if (lt) n.location_title = lt; }, 'rotation: config facts');
+	}
 	// cards + location snapshot every 6 h
 	if (now - (st.cards_at ?? 0) >= 6 * 3600) {
 		write_card(fc.cfg, true);
 		let lr = API.locations(X.token);
 		if (lr.ok) {
-			let snap = map(API.candidate_locations(lr.data, X.settings.exclude_locations), (l) => ({ id: l.id, code: l.code, ping_ip: l.ping_ip }));
+			let snap = map(API.candidate_locations(lr.data, X.settings.exclude_locations), (l) => ({ id: l.id, code: l.code, title: l.title, ping_ip: l.ping_ip }));
 			write_rotation(X.binding, (n) => { n.loc_snapshot = snap; }, 'rotation: location snapshot');
 		}
 		st.cards_at = now;
@@ -739,6 +750,63 @@ function watchdog(recs) {
 		}
 		if (!has) alert('notoken-' + replace(bnd, ':', '-'), 'Нет ни одного роутера с токеном для привязки ' + bnd + ' — некому ротировать');
 	}
+}
+
+// ---------- UI snapshot (/tmp/peers-ss/ui.json): LuCI reads it instantly instead of GitHub round trips ----------
+const UI_FILE = U.RUN + '/ui.json';
+let UI_SLOW = null, UI_SLOW_MONO = 0;
+
+function rotation_view(o) {
+	return { rev: o.rev, server_id: o.server_id, location_id: o.location_id, location: o.location_title, title: o.title,
+		expires_at: o.expires_at, auto_renewal: o.auto_renewal, lock: o.lock, waiting: o.waiting,
+		history: o.history ?? [], updated_at: o.updated_at, link_fp: o.url ? fp(o.url) : null };
+}
+
+function ui_slow(force) {
+	if (!force && UI_SLOW && ST.mono() - UI_SLOW_MONO < 300) return UI_SLOW;
+	let cards = {}, alerts = [], invites = [];
+	if (X.bot_key) {
+		for (let n, o in ST.read_dir(X.cid + '/cards', X.bot_key) ?? {}) if (o?.binding) cards[o.binding] = o;
+		for (let n, a in ST.read_dir(X.cid + '/alerts', X.bot_key) ?? {})
+			push(alerts, { event: a.event, text: a.text, at: a.at, router: a.router });
+		alerts = slice(sort(alerts, (a, b) => b.at - a.at), 0, 20);
+	}
+	let now = ST.now();
+	for (let n, i in ST.read_dir(X.cid + '/invites') ?? {})
+		push(invites, { id: i.id, group: i.group, env: i.env, created_at: i.created_at, expires_at: i.expires_at,
+			used_by: i.used_by, used_name: i.used_by ? C.router_name(X.contour, i.used_by) : null, used_at: i.used_at,
+			revoked: i.revoked, active: !i.revoked && !i.used_by && i.expires_at > now });
+	UI_SLOW = { cards, alerts, invites: sort(invites, (a, b) => b.created_at - a.created_at) };
+	UI_SLOW_MONO = ST.mono();
+	return UI_SLOW;
+}
+
+function write_ui(force) {
+	if (!X?.contour) return null;
+	let rots = {};
+	for (let b in C.all_bindings(X.contour)) {
+		let r = rot_get(b);
+		if (r.ok) rots[b] = rotation_view(r.obj);
+	}
+	let slow = ui_slow(force);
+	let recs = RECS ?? {}, routers = [];
+	for (let rid in sort(keys(X.contour.routers ?? {}))) {
+		let r = rid == X.rid ? router_record() : recs[rid];
+		let eo = C.env_of(X.contour, rid);
+		push(routers, { rid, name: C.router_name(X.contour, rid), me: rid == X.rid, group: eo?.group_id, env: eo?.env_id,
+			binding: eo?.env?.config, status: r?.status, last_contact: r?.last_contact, ping_ms: r?.ping_ms,
+			has_token: r?.has_token, account: r?.account, token_label: r?.token_label, diag_ok: r?.diag_ok, version: r?.version });
+	}
+	let ui = { at: ST.now(), version: VERSION, rid: X.rid, cid: X.cid, repo: X.repo, binding: X.binding,
+		contour: X.contour, settings: C.settings(X.contour), routers, rotations: rots, cards: slow.cards, alerts: slow.alerts,
+		invites: slow.invites, podkop_section: PK.section(), has_token: !!X.token, account: X.token ? +X.acct : null,
+		token_label: X.token ? S.get('ss_label') : null,
+		state: { status: st.status, counter: st.counter, ping_ms: st.ping_ms, ping_at: st.ping_at, last_check: st.last_check,
+			layers: st.layers, diag_ok: st.diag_ok, diag_fails: st.diag_fails, last_rotation: st.last_rotation,
+			ignore_until: st.ignore_until }, podkop: st.podkop, github_error: ST.last_error() };
+	U.mkdirp(U.RUN);
+	U.writejson(UI_FILE, ui);
+	return ui;
 }
 
 function ctx() { return X; }
@@ -842,6 +910,7 @@ function tick_inner() {
 		ensure_rotation_files();
 		heartbeat();
 		if (now_m - (st.watch_mono ?? 0) > 600 && length(keys(recs))) { watchdog(recs); write_summary(recs); st.watch_mono = now_m; }
+		write_ui();
 	}
 }
 
@@ -853,4 +922,4 @@ function tick() {
 }
 
 export { VERSION, init, tick, rotate, refresh_contour, deliver, heartbeat, read_routers, alert, write_rotation, router_record,
-	load_state, save_state, apply_link, first_token_router, ctx, state };
+	load_state, save_state, apply_link, first_token_router, ctx, state, write_ui, recs_refresh, UI_FILE };

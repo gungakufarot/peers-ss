@@ -6,53 +6,142 @@
 
 var E = c.E;
 
-return view.extend({
-	load: function() { return c.api.status(); },
+var EVENTS = [ [ 'rotated', 'Блокировка и ротация' ], [ 'waiting', 'Ротация не помогает' ], [ 'offline', 'Роутер не на связи > 1 ч' ],
+	[ 'account', 'Проблемы токена / конфига' ], [ 'notoken', 'Нет роутера с токеном' ], [ 'badchannel', 'Плохой канал, podkop изменился' ] ];
 
-	renderStatus: function(s) {
-		if (!s.configured) return E('div', { 'class': 'alert-message warning' }, 'Роутер не зарегистрирован в контуре. Запустите install.sh.');
-		var st = s.state || {}, card = s.card || {}, rot = s.rotation || {};
+return view.extend({
+	load: function() { c.css(); return c.api.ui(); },
+
+	hero: function(u) {
+		var st = u.state || {}, rot = (u.rotations || {})[u.binding] || {}, card = (u.cards || {})[u.binding] || {};
+		var exp = rot.expires_at || card.expires_at, left = c.daysLeft(exp);
 		var last = (rot.history || []).slice(-1)[0];
-		var rows = [
-			[ 'Роутер', s.name + ' (' + s.rid + ')' ],
-			[ 'Контур', (s.contour_name || '—') + ' (' + s.cid + ')' ],
-			[ 'Группа / среда', (s.group || 'одиночный') + ' / ' + (s.env || '—') ],
-			[ 'Назначенный конфиг', s.binding ? (card.title || s.binding) : 'не назначен' ],
-			[ 'Локация / сервер', rot.location_id ? ('локация ' + rot.location_id + ', сервер ' + rot.server_id) : '—' ],
-			[ 'Срок действия', card.expires_at ? c.fmtDate(card.expires_at) + (card.auto_renewal ? ' (автопродление)' : '') : '—' ],
-			[ 'Статус', c.badge(st.status) ],
-			[ 'Пинг через vless', st.ping_ms ? st.ping_ms + ' мс (' + c.ago(st.ping_at) + ')' : '—' ],
-			[ 'Диагностика podkop', st.diag_ok === false ? E('span', { 'style': 'color:#cf222e' }, 'ошибки: ' + (st.diag_fails || []).join(', ')) : (st.diag_ok ? 'зелёная' : '—') ],
-			[ 'Последняя проверка', c.ago(st.last_check) + (st.counter ? ', сбоев подряд: ' + st.counter : '') ],
-			[ 'Последняя ротация', last ? c.fmtTime(last.at) + ': сервер ' + last.from_server + ' → ' + last.to_server + ' (' + last.location + '), ' + last.reason : 'не было' ],
-			[ 'Токен StealthSurf', s.has_token ? 'есть (аккаунт ' + s.account + ')' : 'нет — ведомый роутер' ],
-			[ 'Версия', s.version + (s.podkop && !s.podkop.ok ? ' — podkop: ' + s.podkop.reason : '') ]
-		];
-		if (rot.waiting) rows.push([ 'Режим ожидания', 'с ' + c.fmtTime(rot.waiting.since) + ', следующая попытка ' + c.fmtTime(rot.waiting.next_try) ]);
-		if (s.github_error) rows.push([ 'GitHub', E('span', { 'style': 'color:#cf222e' }, 'недоступен: ' + s.github_error) ]);
-		var tbl = E('table', { 'class': 'table' }, rows.map(function(r) {
-			return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left', 'style': 'width:30%' }, E('strong', r[0])), E('td', { 'class': 'td left' }, r[1]) ]);
-		}));
-		var alerts = (s.alerts || []).map(function(a) { return E('li', c.fmtTime(a.at) + ' — ' + a.text); });
-		return E('div', [ tbl, E('h3', 'Алерты контура'), alerts.length ? E('ul', alerts) : E('p', { 'class': 'cbi-value-description' }, 'нет') ]);
+		var me = (u.routers || []).filter(function(r) { return r.me; })[0] || {};
+		var g = me.group ? (u.contour.groups[me.group] || {}) : null;
+		var envName = g ? g.envs[me.env].name : 'одиночный';
+		return E('div', { 'class': 'card' }, [
+			E('div', { 'class': 'hero' }, [
+				E('div', [
+					E('div', { 'class': 'row' }, [ c.pill(st.status), E('span', { 'class': 'muted' }, 'проверено ' + c.ago(st.last_check)) ]),
+					E('div', { 'class': 'big' }, c.cfgTitle(u, u.binding)),
+					E('div', { 'class': 'muted' }, (me.name || u.rid) + ' · ' + (g ? g.name + ' / ' : '') + envName + ' · контур «' + (u.contour.name || u.cid) + '»')
+				]),
+				E('div', { 'class': 'row' }, [
+					c.btn('Проверить сейчас', function() { c.job('check', 'Проверка'); }, 'cbi-button-action'),
+					u.has_token && u.binding ? c.btn('Сменить сервер', function() {
+						if (confirm('Перенести конфиг на другой сервер сейчас? Это касается ВСЕХ роутеров с этим конфигом.')) c.job('rotate', 'Смена сервера');
+					}, 'cbi-button-negative') : ''
+				])
+			]),
+			E('div', { 'style': 'margin-top:14px' }, c.kv([
+				[ 'Локация и сервер', rot.server_id ? (rot.location || ('локация ' + rot.location_id)) + ', сервер ' + rot.server_id : '—' ],
+				[ 'Действует до', exp ? E('span', [ c.fmtDate(exp) + ' ', left != null ? E('span', { 'class': 'pill ' + (left <= 3 ? 'bad' : left <= 7 ? 'warn' : 'ok') }, left > 0 ? 'ещё ' + left + ' дн' : 'истёк') : '', (rot.auto_renewal || card.auto_renewal) ? ' · автопродление' : '' ]) : '—' ],
+				[ 'Пинг через vless', st.ping_ms ? st.ping_ms + ' мс' : '—' ],
+				[ 'Последняя ротация', last ? c.fmtTime(last.at) + ' — ' + (last.location || '') + ', ' + c.reason(last.reason) : 'не было' ],
+				[ 'Токен StealthSurf', u.has_token ? 'есть' + (u.token_label ? ' — ' + u.token_label : '') : 'нет (ведомый роутер)' ]
+			]))
+		]);
 	},
 
-	render: function(s) {
-		var self = this;
-		var box = E('div', {}, this.renderStatus(s));
-		poll.add(function() { return c.api.status().then(function(n) { box.innerHTML = ''; box.appendChild(self.renderStatus(n)); }); }, 15);
-		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', 'Peers-SS — обзор'),
-			E('div', { 'class': 'cbi-section' }, [
-				box,
-				E('div', { 'class': 'right' }, [
-					E('button', { 'class': 'btn cbi-button-action', 'click': function() { c.job('check', 'Проверить сейчас'); } }, 'Проверить сейчас'), ' ',
-					E('button', { 'class': 'btn cbi-button-negative', 'click': function() {
-						if (confirm('Сменить сервер сейчас? Конфиг будет перенесён для ВСЕХ роутеров с этой привязкой.')) c.job('rotate', 'Смена сервера');
-					} }, 'Сменить сервер сейчас')
-				])
-			])
-		]);
+	banners: function(u) {
+		var st = u.state || {}, rot = (u.rotations || {})[u.binding] || {}, out = [];
+		if (rot.waiting) out.push(E('div', { 'class': 'banner bad' }, 'Режим ожидания: ротация не помогает (техработы или массовая блокировка). Следующая попытка — ' + c.fmtTime(rot.waiting.next_try) + '.'));
+		if (u.podkop && u.podkop.ok === false) out.push(E('div', { 'class': 'banner bad' }, 'podkop: ' + u.podkop.reason + ' — нужна перенастройка.'));
+		if (u.github_error) out.push(E('div', { 'class': 'banner warn' }, 'Хранилище GitHub недоступно (' + u.github_error + '). Роутер работает по последним данным.'));
+		if (st.diag_ok === false) out.push(E('div', { 'class': 'banner warn' }, 'Диагностика podkop: ' + (st.diag_fails || []).join(', ')));
+		if (!u.binding) out.push(E('div', { 'class': 'banner warn' }, 'Конфиг для этого роутера не назначен — назначьте его во вкладке «Роутеры».'));
+		return out;
+	},
+
+	contourCard: function(u) {
+		var tiles = (u.routers || []).map(function(r) {
+			return E('div', { 'class': 'chip', 'style': 'cursor:default' }, [ c.dot(r.status), E('b', r.name), E('span', { 'class': 'muted' },
+				(r.ping_ms ? r.ping_ms + ' мс · ' : '') + c.ago(r.last_contact) + (r.has_token ? ' · 🔑' : '')) ]);
+		});
+		return E('div', { 'class': 'card' }, [ E('h3', [ 'Роутеры контура', E('span', { 'class': 'sp' }), E('span', { 'class': 'muted' }, (u.routers || []).length + ' шт.') ]), E('div', tiles) ]);
+	},
+
+	alertsCard: function(u) {
+		var items = (u.alerts || []).slice(0, 8).map(function(a) {
+			return E('li', [ E('span', { 'class': 'muted' }, c.fmtTime(a.at) + ' · '), a.text ]);
+		});
+		return E('div', { 'class': 'card' }, [ E('h3', 'События'), items.length ? E('ul', { 'class': 'feed' }, items) : E('p', { 'class': 'muted' }, 'Событий нет — всё спокойно.') ]);
+	},
+
+	settingsCard: function(u, redraw) {
+		var s = u.settings || {};
+		var iv = E('input', { 'type': 'number', 'class': 'cbi-input-text', 'value': s.check_interval_s, 'min': 15, 'style': 'width:7em' }),
+			th = E('input', { 'type': 'number', 'class': 'cbi-input-text', 'value': s.fail_threshold, 'min': 1, 'style': 'width:7em' }),
+			rt = E('input', { 'type': 'number', 'class': 'cbi-input-text', 'value': s.retry_min, 'min': 1, 'style': 'width:7em' }),
+			ex = E('input', { 'type': 'text', 'class': 'cbi-input-text w', 'value': (s.exclude_locations || []).join(', ') });
+		return E('details', { 'class': 'card' }, [ E('summary', 'Настройки контура'),
+			c.kv([ [ 'Проверка каждые, с', iv ], [ 'Сбоев подряд до ротации', th ], [ 'Повтор в ожидании, мин', rt ],
+				[ 'Не переходить в локации', E('div', [ ex, E('div', { 'class': 'muted' }, 'smart — «Умная», RU — Россия; коды через запятую') ]) ],
+				[ 'Секция podkop (этот роутер)', E('code', u.podkop_section || '—') ], [ 'Хранилище', E('code', u.repo || '—') ] ]),
+			E('div', { 'class': 'right' }, c.btn('Сохранить', function() {
+				c.op('settings', { check_interval_s: +iv.value, fail_threshold: +th.value, retry_min: +rt.value, exclude_locations: ex.value }, u.contour.rev)
+					.then(function(r) { if (r) { c.notify('Настройки сохранены — роутеры контура применят их в течение минуты'); redraw(); } });
+			}, 'cbi-button-save')) ]);
+	},
+
+	notifyCard: function(u, redraw) {
+		var s = u.settings || {}, ev = s.bot_events || {};
+		var key = E('input', { 'type': 'password', 'class': 'cbi-input-text w', 'value': s.bot_key || '', 'style': 'font-family:monospace' });
+		var checks = EVENTS.map(function(e) { return E('label', { 'style': 'display:block' }, [ E('input', { 'type': 'checkbox', 'value': e[0], 'checked': ev[e[0]] === false ? null : '' }), ' ' + e[1] ]); });
+		return E('details', { 'class': 'card' }, [ E('summary', 'Уведомления (Telegram-бот)'),
+			c.kv([ [ 'Ключ бота', E('div', { 'class': 'row', 'style': 'flex-wrap:nowrap' }, [ key, E('button', { 'class': 'ib', 'click': function() { key.type = key.type == 'password' ? 'text' : 'password'; } }, '👁') ]) ],
+				[ 'Алерты администратору', E('div', checks) ],
+				[ 'Карточки конфигов', E('span', { 'class': 'muted' }, 'название, срок, автопродление — раз в 6 ч, без ссылок и токенов') ] ]),
+			E('div', { 'class': 'right' }, [
+				c.btn('Тестовый алерт', function() { c.api.testAlert().then(function(r) { if (!c.err(r)) c.notify('Алерт записан — бот перешлёт его в течение 5 минут'); }); }), ' ',
+				c.btn('Сохранить', function() {
+					var evs = {}; checks.forEach(function(l) { evs[l.firstChild.value] = l.firstChild.checked; });
+					c.op('settings', { bot_key: key.value.trim(), bot_events: evs }, u.contour.rev).then(function(r) { if (r) { c.notify('Сохранено'); redraw(); } });
+				}, 'cbi-button-save') ]) ]);
+	},
+
+	securityCard: function(u) {
+		var res = E('span', { 'class': 'muted' });
+		return E('details', { 'class': 'card' }, [ E('summary', 'Связь и безопасность'),
+			E('div', { 'class': 'row' }, [
+				c.btn('Проверить связь с API и GitHub', function() {
+					res.textContent = 'проверка…';
+					c.api.apiCheck().then(function(r) {
+						res.textContent = 'GitHub: ' + (r.github ? '✓' : '✗ HTTP ' + r.github_status) + ' · StealthSurf: ' + (r.stealthsurf != null ? (r.stealthsurf ? '✓' : '✗ ' + r.stealthsurf_status) : (r.stealthsurf_reachable ? '✓ (без токена)' : '✗'));
+					});
+				}),
+				c.btn('Сменить пароль контура', function() {
+					var o = E('input', { 'type': 'text', 'class': 'cbi-input-text w' }), n1 = E('input', { 'type': 'text', 'class': 'cbi-input-text w' }), n2 = E('input', { 'type': 'text', 'class': 'cbi-input-text w' });
+					c.modal('Пароль контура', [ c.kv([ [ 'Текущий', o ], [ 'Новый', n1 ], [ 'Ещё раз', n2 ] ]),
+						E('p', { 'class': 'muted' }, 'Все файлы контура перешифруются, остальные роутеры перейдут на новый ключ сами (до 10 мин).') ],
+						[ c.btn('Сменить', function() {
+							if (n1.value != n2.value) return alert('Пароли не совпадают');
+							if (n1.value.length < 8) return alert('Минимум 8 символов');
+							c.api.passwordChange(o.value, n1.value).then(function(r) { if (!c.err(r)) c.job('passwd', 'Смена пароля контура'); });
+						}, 'cbi-button-action') ]);
+				}, 'cbi-button-negative'), res ]) ]);
+	},
+
+	render: function(u) {
+		var self = this, root = E('div', { 'class': 'pss' });
+		var draw = function(d) {
+			root.innerHTML = '';
+			if (!d.configured) { root.appendChild(E('div', { 'class': 'banner warn' }, 'Роутер не зарегистрирован в контуре. Запустите install.sh.')); return; }
+			var redraw = function() { c.api.ui().then(draw); };
+			[ E('h2', 'Peers-SS') ].concat(self.banners(d), [ self.hero(d), self.contourCard(d), self.alertsCard(d),
+				self.settingsCard(d, redraw), self.notifyCard(d, redraw), self.securityCard(d), c.footer(d, function() { c.refresh(redraw); }) ])
+				.forEach(function(n) { root.appendChild(n); });
+		};
+		draw(u);
+		// light refresh of the status block only (details/inputs stay as the user left them)
+		poll.add(function() {
+			return c.api.ui().then(function(n) {
+				if (!n.configured) return;
+				var hero = root.querySelector('.card');
+				if (hero && !root.querySelector('details[open]')) draw(n);
+			});
+		}, 20);
+		return root;
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null
 });

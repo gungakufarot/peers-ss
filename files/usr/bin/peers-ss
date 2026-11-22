@@ -308,6 +308,14 @@ function cmd_check() {
 	cmd_status();
 }
 
+function cmd_snapshot() {
+	need_engine();
+	E.load_state();
+	E.recs_refresh(true);
+	E.write_ui(true);
+	out('UI snapshot refreshed');
+}
+
 function cmd_daemon() {
 	U.set_log_echo(false);
 	let interval = 45;
@@ -632,6 +640,7 @@ case 'bot-key': cmd_bot_key(argv); break;
 case 'contour': cmd_contour(argv); break;
 case 'status': cmd_status(); break;
 case 'check': cmd_check(); break;
+case 'snapshot': cmd_snapshot(); break;
 case 'rotate': cmd_rotate(argv); break;
 case 'daemon': cmd_daemon(); break;
 case 'wizard': cmd_wizard(); break;
