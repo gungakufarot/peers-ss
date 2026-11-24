@@ -313,21 +313,16 @@ function cmd_snapshot() {
 	E.load_state();
 	E.recs_refresh(true);
 	E.write_ui(true);
-	fs.writefile(E.UI_DIRTY, '1');   // the daemon re-reads invites/alerts/cards on its next tick too
+	fs.writefile(E.UI_DIRTY, '1');   // the service re-reads invites/alerts/cards on its next tick too
 	out('UI snapshot refreshed');
 }
 
-function cmd_daemon() {
+// one service iteration, run by /usr/share/peers-ss/loop.sh (procd) as a separate short-lived process:
+// a long-running interpreter kept growing (curl output, JSON, crypto) until the kernel OOM-killed it
+function cmd_tick() {
 	U.set_log_echo(false);
-	let interval = 45;
-	while (true) {
-		let t0 = time();
-		if (E.init()) {
-			try { E.tick(); } catch (e) { U.log('error', 'tick failed: ' + e); }
-			interval = E.ctx()?.settings?.check_interval_s ?? 45;
-		} else U.log('warn', 'not configured, sleeping');
-		U.sleep_s(max(5, interval - (time() - t0)));
-	}
+	if (E.init()) { fs.unlink(U.RUN + '/not-configured'); E.tick(); }
+	else if (!fs.stat(U.RUN + '/not-configured')) { U.log('warn', 'not configured, waiting'); U.mkdirp(U.RUN); fs.writefile(U.RUN + '/not-configured', '1'); }
 }
 
 // ---- config assign (token router): bind a vless config to this router's environment ----
@@ -583,7 +578,7 @@ function cmd_uninstall(args) {
 		}
 	}
 	if (index(args, '--yes') < 0 && !from_opkg && lc(ask('Remove Peers-SS from this router? podkop and its current link stay. [y/N] ') ?? '') != 'y') fail('cancelled');
-	system('/etc/init.d/peers-ss stop >/dev/null 2>&1; /etc/init.d/peers-ss disable >/dev/null 2>&1');
+	system('/etc/init.d/peers-ss stop >/dev/null 2>&1; /etc/init.d/peers-ss disable >/dev/null 2>&1; for p in $(pgrep -f "/usr/bin/peers-ss tick"); do kill $p; done; sleep 1');
 	if (E.init() && E.refresh_contour()) {
 		let x = E.ctx();
 		let w = ST.update(C.p_contour(x.cid), (c) => {
@@ -625,7 +620,7 @@ function cmd_invite(args) {
 
 function usage() {
 	out('Peers-SS ' + VERSION + '\nusage: peers-ss <command>\n' +
-		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | daemon\n  invite create <group> [env] [hours] | create standalone [hours] | revoke <id> | list\n  uninstall [--yes]\n  version');
+		'  token set|show [--reveal]|check|delete\n  configs\n  config select [N]|assign|show\n  locations\n  podkop status|setup|apply [--force] [--setup]|diag\n  github-token set | bot-key set\n  contour create <repo> | show | join-dev <repo> <cid> <group> <env>\n  status | check | rotate [--dry-run] | tick\n  invite create <group> [env] [hours] | create standalone [hours] | revoke <id> | list\n  uninstall [--yes]\n  version');
 }
 
 let argv = [...ARGV];
@@ -643,7 +638,8 @@ case 'status': cmd_status(); break;
 case 'check': cmd_check(); break;
 case 'snapshot': cmd_snapshot(); break;
 case 'rotate': cmd_rotate(argv); break;
-case 'daemon': cmd_daemon(); break;
+case 'tick': cmd_tick(); break;
+case 'daemon': fail('the service now runs /usr/share/peers-ss/loop.sh (/etc/init.d/peers-ss start); one iteration: peers-ss tick'); break;
 case 'wizard': cmd_wizard(); break;
 case 'uninstall': cmd_uninstall(argv); break;
 case 'passwd-apply': cmd_passwd_apply(); break;

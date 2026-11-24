@@ -37,6 +37,12 @@ function now() {
 	return int(clock_ref.gh + (mono() - clock_ref.mono));
 }
 
+// GitHub clock and last success survive between short-lived `peers-ss tick` processes (monotonic clock
+// and /tmp both reset on reboot, so the values stay comparable)
+const RT = CACHE + '/runtime.json';
+function rt_load() { let r = readjson(RT); if (r) { clock_ref = r.clock ?? null; last_ok = r.last_ok ?? 0; } }
+function rt_save() { mkdirp(CACHE); writejson(RT, { clock: clock_ref, last_ok }); }
+
 function reachable_since() { return last_ok; }   // monotonic of last success (0 = never)
 function last_error() { return last_err; }
 
@@ -168,7 +174,7 @@ function get_cached(path, key) {
 }
 
 // all objects of a directory: one listing request (ETag) + only files whose git sha changed.
-// Decrypted objects are cached in RAM per sha (long-lived daemon / rpcd). Returns { name: obj } or null.
+// Decrypted objects are cached in RAM per sha (rpcd, several reads within one tick). Returns { name: obj } or null.
 let DIRCACHE = {};
 function read_dir(dir, key) {
 	let list = list_dir(dir);
@@ -177,6 +183,12 @@ function read_dir(dir, key) {
 	for (let f in list) {
 		let p = dir + '/' + f.name, c = DIRCACHE[p];
 		if (c && c.sha == f.sha) { if (c.obj != null) out[f.name] = c.obj; continue; }
+		// each tick is a new process: unchanged files come from the disk cache (git blob sha = listing sha), no request
+		let dc = readjson(cache_file(p));
+		if (dc?.sha == f.sha && dc.text) {
+			let u = unwrap(p, dc.text, key);
+			if (u.ok) { DIRCACHE[p] = { sha: f.sha, obj: u.obj }; out[f.name] = u.obj; continue; }
+		}
 		let r = get(p, key);
 		DIRCACHE[p] = { sha: f.sha, obj: r.ok ? r.obj : null };
 		if (r.ok) out[f.name] = r.obj;
@@ -219,4 +231,4 @@ function update(path, fn, opts) {
 	return { ok: false, err: 'too many conflicts', conflicts };
 }
 
-export { read_dir, get_cached, SCHEMA, init, set_key, set_keyring, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };
+export { rt_load, rt_save, read_dir, get_cached, SCHEMA, init, set_key, set_keyring, now, reachable_since, last_error, get_raw, put_raw, delete_raw, list_dir, wrap, unwrap, get, put, update, mono };

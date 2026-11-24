@@ -118,13 +118,26 @@ function backup_orig() {
 	}
 }
 
+// marker of restarts done by Peers-SS: `podkop restart` = stop (flag 1) + start (flag 0), and a failed start
+// exits before writing 0 — that must not look like "the owner stopped podkop"
+function mark_restart() { mkdirp(RUN); fs.writefile(RUN + '/podkop-restart', '' + time()); }
+
 function restart() {
+	mark_restart();
 	// LuCI "Save & Apply": uci commit triggers procd -> restart. We commit and call restart directly
 	// so we know when it finished (procd trigger would run the same restart after reload delay).
 	return sh('/etc/init.d/podkop restart >/dev/null 2>&1').code;
 }
 
 function sing_box_running() { return sh('pidof sing-box').code == 0; }
+
+// `podkop stop` (CLI, init script, LuCI) sets settings.shutdown_correctly=1, `podkop start` sets 0.
+// 1 = the owner stopped podkop on purpose: Peers-SS must not start it again (no health restart, no apply).
+function stopped_by_user() {
+	if (cursor().get('podkop', 'settings', 'shutdown_correctly') != '1') return false;
+	let ours = +(fs.readfile(RUN + '/podkop-restart') ?? 0), cm = fs.stat('/etc/config/podkop')?.mtime ?? 0;
+	return !(ours && cm >= ours && cm - ours <= 180);   // flag written by our own (failed) restart
+}
 
 // after a podkop restart dnsmasq is reconfigured: wait until the router resolves names again (GitHub/API writes follow)
 function wait_dns(max_s) {
@@ -270,6 +283,7 @@ function apply_link(link, opts) {
 			}
 			if (!sing_box_running()) {
 				log('error', 'podkop: sing-box still down, stopping podkop to restore dnsmasq');
+				mark_restart();   // our safety stop, not the owner's: health may start podkop again later
 				sh('/etc/init.d/podkop stop');
 			}
 			res.rolled_back = true;
@@ -307,4 +321,4 @@ function check_podkop() {
 }
 
 export { PODKOP, installed, version, section, proxy_sections, section_ok, create_section, ensure_mixed, listen_address,
-	mixed_proxy_url, current_link, wait_dns, restart, sing_box_running, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev, check_podkop };
+	mixed_proxy_url, current_link, wait_dns, restart, sing_box_running, stopped_by_user, tunnel_check, wait_up, latency, diagnostics, apply_link, restore_prev, check_podkop };

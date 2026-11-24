@@ -14,7 +14,7 @@ import * as P from './ping.uc';
 import { fp } from './crypto.uc';
 import { try_rekey, switch_key } from './invite.uc';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const STATE = U.RUN + '/state.json';
 const LOCK_TTL = 180;
 const ROT_HISTORY = 10;
@@ -25,7 +25,6 @@ const OFFLINE_S = 3600;
 const BAD_WINDOW = 1800, BAD_IGNORE = 3600;
 
 let X = null;      // context
-let START_MONO = null;   // monotonic start of this process (GitHub-down timer)
 let st = null;     // local volatile state (RAM)
 
 function load_state() { st = U.readjson(STATE) ?? { counter: 0 }; return st; }
@@ -45,8 +44,9 @@ function init() {
 	if (!X.rid || !X.cid || !X.repo || !X.key || !X.gh) return false;
 	ST.init(X.repo, X.gh, X.key);
 	ST.set_keyring(sec.prev_keys ?? []);
+	ST.rt_load();
 	load_state();
-	START_MONO ??= ST.mono();
+	st.start_mono ??= ST.mono();   // first tick since boot (GitHub-down timer)
 	return true;
 }
 
@@ -151,6 +151,12 @@ function rot_get(binding) { return ST.get(rot_path(binding)); }
 function apply_link(url, why) {
 	let cur = PK.current_link();
 	if (url == cur) return { changed: false, ok: true };
+	// owner stopped podkop: applying would start it again; callers keep applied_rev, deliver() applies later
+	if (PK.stopped_by_user()) {
+		if (st.deferred_fp != fp(url)) { st.deferred_fp = fp(url); U.log('info', 'new link deferred: podkop stopped by the owner (' + why + ')'); }
+		return { changed: false, ok: false, deferred: true };
+	}
+	delete st.deferred_fp;
 	U.log('info', 'applying new link (' + why + ')');
 	let r = PK.apply_link(url, { setup: true });
 	st.applied_fp = fp(PK.current_link() ?? '');
@@ -272,8 +278,8 @@ function wait_new_link(binding, max_s) {
 		U.sleep_s(10);
 		let r = rot_get(binding);
 		if (r.ok && r.obj.url && r.obj.url != cur) {
-			apply_link(r.obj.url, 'rotation by ' + (r.obj.lock?.by ?? r.obj.history?.[-1]?.by ?? '?'));
-			st.applied_rev = r.obj.rev;
+			let a = apply_link(r.obj.url, 'rotation by ' + (r.obj.lock?.by ?? r.obj.history?.[-1]?.by ?? '?'));
+			if (!a.deferred) st.applied_rev = r.obj.rev;
 			return true;
 		}
 		if (r.ok && !r.obj.lock) return false;
@@ -328,8 +334,8 @@ function rotate_inner(opts) {
 	// 1. newer revision already in the file
 	let rf = opts.nolock ? null : rot_get(binding);
 	if (rf?.ok && rf.obj.url && rf.obj.url != cur_link && (rf.obj.rev ?? 0) > (st.applied_rev ?? -1) && !opts.dry_run) {
-		apply_link(rf.obj.url, 'rotation file newer');
-		st.applied_rev = rf.obj.rev;
+		let a = apply_link(rf.obj.url, 'rotation file newer');
+		if (!a.deferred) st.applied_rev = rf.obj.rev;
 		return { ok: true, action: 'applied' };
 	}
 	if (!opts.manual && !opts.dry_run && rf?.ok && rf.obj.waiting && now < rf.obj.waiting.next_try)
@@ -348,7 +354,7 @@ function rotate_inner(opts) {
 				U.log('info', 'rotation lock held by ' + l.obj.lock.by + ', waiting for new link');
 				return { ok: wait_new_link(binding), action: 'locked' };
 			}
-			if (l.why == 'newer') { apply_link(l.obj.url, 'rotation file newer'); st.applied_rev = l.obj.rev; return { ok: true, action: 'applied' }; }
+			if (l.why == 'newer') { let a = apply_link(l.obj.url, 'rotation file newer'); if (!a.deferred) st.applied_rev = l.obj.rev; return { ok: true, action: 'applied' }; }
 			if (l.why == 'github') return { ok: false, action: 'error', err: 'cannot take lock (GitHub)' };
 			return { ok: false, action: l.why };
 		}
@@ -380,8 +386,8 @@ function rotate_inner(opts) {
 				n.rev = (n.rev ?? 0) + 1; n.url = cfg.connection_url; n.server_id = cfg.server_id; n.location_id = cfg.location_id;
 				n.lock = null; n.updated_at = ST.now();
 			}, 'rotation: link from API');
-			apply_link(cfg.connection_url, 'API link');
-			if (w.ok) st.applied_rev = w.obj.rev;
+			let a = apply_link(cfg.connection_url, 'API link');
+			if (w.ok && !a.deferred) st.applied_rev = w.obj.rev;
 			return { ok: true, action: 'applied_api' };
 		}
 		U.log('info', 'API link differs but may be a cached (stale) answer — ignored');
@@ -517,7 +523,7 @@ function rotate(opts) {
 // ---------- GitHub unavailable mode (spec §5) ----------
 function github_down_s() {
 	let since = ST.reachable_since();
-	return ST.mono() - (since > 0 ? since : START_MONO);
+	return ST.mono() - (since > 0 ? since : (st.start_mono ?? ST.mono()));
 }
 
 function rotate_without_github() {
@@ -556,10 +562,17 @@ function writeback() {
 }
 
 // ---------- follower report / bad channel ----------
-let RECS = {}, RECS_MONO = 0;
+// every tick is a new process: caches live in /tmp, not in RAM of a long-running interpreter
+const RECS_FILE = U.RUN + '/recs.json', UI_SLOW_FILE = U.RUN + '/ui-slow.json';
+let RECS = null;
 function recs_refresh(force) {
-	if (force || ST.mono() - RECS_MONO > 240) { RECS = read_routers(); RECS_MONO = ST.mono(); }
-	return RECS;
+	let c = RECS ?? U.readjson(RECS_FILE);
+	if (force || !c || ST.mono() - c.mono > 240 || ST.mono() < c.mono) {
+		c = { mono: ST.mono(), recs: read_routers() };
+		U.writejson(RECS_FILE, c);
+	}
+	RECS = c;
+	return c.recs;
 }
 
 // one trigger per blocked episode; ignored (bad channel) if this router triggered twice in 30 min while others pass
@@ -688,7 +701,7 @@ function reconcile(recs, every_s) {
 			n.rev = (n.rev ?? 0) + 1; n.url = fc.cfg.connection_url; n.server_id = fc.cfg.server_id;
 			n.location_id = fc.cfg.location_id; n.updated_at = ST.now();
 		}, 'rotation: reconcile with API');
-		if (w.ok) { apply_link(fc.cfg.connection_url, 'reconcile'); st.applied_rev = w.obj.rev; }
+		if (w.ok) { let a = apply_link(fc.cfg.connection_url, 'reconcile'); if (!a.deferred) st.applied_rev = w.obj.rev; }
 	}
 	// config facts for LuCI (no secrets): title, expiry, auto-renewal, location
 	if (r.ok) {
@@ -754,7 +767,6 @@ function watchdog(recs) {
 
 // ---------- UI snapshot (/tmp/peers-ss/ui.json): LuCI reads it instantly instead of GitHub round trips ----------
 const UI_FILE = U.RUN + '/ui.json';
-let UI_SLOW = null, UI_SLOW_MONO = 0;
 
 function rotation_view(o) {
 	return { rev: o.rev, server_id: o.server_id, location_id: o.location_id, location: o.location_title, title: o.title,
@@ -765,7 +777,8 @@ function rotation_view(o) {
 const UI_DIRTY = U.RUN + '/ui.dirty';   // touched by LuCI after invite/alert changes and by `peers-ss snapshot`
 function ui_slow(force) {
 	if (fs.stat(UI_DIRTY)) { force = true; fs.unlink(UI_DIRTY); }
-	if (!force && UI_SLOW && ST.mono() - UI_SLOW_MONO < 300) return UI_SLOW;
+	let c = U.readjson(UI_SLOW_FILE);
+	if (!force && c && ST.mono() - c.mono < 300 && ST.mono() >= c.mono) return c.slow;
 	let cards = {}, alerts = [], invites = [];
 	if (X.bot_key) {
 		for (let n, o in ST.read_dir(X.cid + '/cards', X.bot_key) ?? {}) if (o?.binding) cards[o.binding] = o;
@@ -778,9 +791,9 @@ function ui_slow(force) {
 		push(invites, { id: i.id, group: i.group, env: i.env, created_at: i.created_at, expires_at: i.expires_at,
 			used_by: i.used_by, used_name: i.used_by ? C.router_name(X.contour, i.used_by) : null, used_at: i.used_at,
 			revoked: i.revoked, active: !i.revoked && !i.used_by && i.expires_at > now });
-	UI_SLOW = { cards, alerts, invites: sort(invites, (a, b) => b.created_at - a.created_at) };
-	UI_SLOW_MONO = ST.mono();
-	return UI_SLOW;
+	let slow = { cards, alerts, invites: sort(invites, (a, b) => b.created_at - a.created_at) };
+	U.writejson(UI_SLOW_FILE, { mono: ST.mono(), slow });
+	return slow;
 }
 
 function write_ui(force) {
@@ -791,7 +804,7 @@ function write_ui(force) {
 		if (r.ok) rots[b] = rotation_view(r.obj);
 	}
 	let slow = ui_slow(force);
-	let recs = RECS ?? {}, routers = [];
+	let recs = (RECS ?? U.readjson(RECS_FILE))?.recs ?? {}, routers = [];
 	for (let rid in sort(keys(X.contour.routers ?? {}))) {
 		let r = rid == X.rid ? router_record() : recs[rid];
 		let eo = C.env_of(X.contour, rid);
@@ -822,6 +835,7 @@ function tick_inner() {
 	let now_m = ST.mono();
 	U.cleanup_tmp();
 	let gh_ok = refresh_contour();
+	ST.rt_save();
 	if (!X.binding) { st.status = 'no_binding'; if (gh_ok) { heartbeat(); serve_requests(); ensure_rotation_files(); } return; }
 	if (st.status == 'update_required') return;
 
@@ -839,14 +853,20 @@ function tick_inner() {
 	// health (4 layers)
 	let link = PK.current_link();
 	let h = link ? H.check(link) : { verdict: 'no_link' };
+	if (h.verdict != 'podkop_down') delete st.pk_user_stop;
 	st.layers = h;
 	st.last_check = ST.now();
 	let waiting = (st.rot?.waiting && ST.now() < st.rot.waiting.next_try + 600) || (st.waiting_until && ST.now() < st.waiting_until + 600);
 	if (h.verdict == 'no_internet') st.status = 'no_internet';
 	else if (h.verdict == 'podkop_down') {
 		st.status = 'podkop_down';
-		U.log('warn', 'podkop/sing-box down — restarting podkop');
-		PK.restart();
+		// spec §5 layer 2: restart a crashed podkop — but never one the owner stopped, and at most once in 10 min
+		if (PK.stopped_by_user()) { if (!st.pk_user_stop) U.log('info', 'podkop stopped by the owner — not restarting'); st.pk_user_stop = true; }
+		else if (now_m - (st.pk_restart_mono ?? -1e9) >= 600 || now_m < (st.pk_restart_mono ?? 0)) {
+			st.pk_restart_mono = now_m;
+			U.log('warn', 'podkop/sing-box down — restarting podkop');
+			PK.restart();
+		}
 	}
 	else if (h.verdict == 'ok') {
 		let was_blocked = !!st.episode;
@@ -868,7 +888,8 @@ function tick_inner() {
 	}
 	save_state();
 
-	let blocked = st.counter >= X.settings.fail_threshold;
+	let pk_down = h.verdict == 'podkop_down';
+	let blocked = !pk_down && st.counter >= X.settings.fail_threshold;
 	let ignore = st.ignore_until && ST.now() < st.ignore_until;
 	if (blocked && !ignore) {
 		if (!st.episode) {
@@ -899,7 +920,7 @@ function tick_inner() {
 	}
 
 	// GitHub down: token routers compare with API every 2 min (never adopting a possibly cached/blocked link)
-	if (!gh_ok && github_down_s() >= 60 && my_token_fits(X.binding) && ST.now() - (st.gh_down_check ?? 0) >= 120) {
+	if (!pk_down && !gh_ok && github_down_s() >= 60 && my_token_fits(X.binding) && ST.now() - (st.gh_down_check ?? 0) >= 120) {
 		st.gh_down_check = ST.now();
 		let fc = find_config(X.token, bind_parts().config_id);
 		if (!fc.err && fc.cfg.connection_url != PK.current_link() && api_link_trusted(fc.cfg, null)) {
@@ -920,10 +941,13 @@ function tick_inner() {
 
 function tick() {
 	if (!engine_lock(60)) { U.log('info', 'tick skipped: another Peers-SS process is working'); return; }
+	ST.rt_load(); load_state();
 	try { tick_inner(); } catch (e) { U.log('error', 'tick failed: ' + e + '\n' + (e.stacktrace?.[0]?.context ?? '')); }
 	// snapshot on every tick (also no_binding / podkop changed / GitHub down: status must stay fresh)
 	try { write_ui(); } catch (e) { U.log('error', 'ui snapshot failed: ' + e); }
 	save_state();
+	ST.rt_save();
+	U.writefile(U.RUN + '/interval', '' + (X?.settings?.check_interval_s ?? 45));   // read by the service loop
 	engine_unlock();
 }
 
